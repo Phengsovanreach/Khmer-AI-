@@ -241,6 +241,11 @@ async def ready(response: Response):
 @app.post("/api/auth/register", response_model=AuthResponse)
 async def api_register(req: RegisterRequest):
     """Register a new user account with PBKDF2 hashed password and create session."""
+    if not req.terms_accepted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="សូមយល់ព្រមលើលក្ខខណ្ឌប្រើប្រាស់ / You must agree to the Terms and Privacy Policy",
+        )
     try:
         user_dict, token = register_user(req.name, req.email, req.password)
         return AuthResponse(

@@ -29,16 +29,17 @@ EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 PBKDF2_ITERATIONS = 600_000  # OWASP recommended standard for SHA-256
 
 
-def _get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(AUTH_DB_FILE), check_same_thread=False)
+def _get_connection(db_file: Path | str | None = None) -> sqlite3.Connection:
+    target = db_file or AUTH_DB_FILE
+    conn = sqlite3.connect(str(target), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_auth_db() -> None:
+def init_auth_db(db_file: Path | str | None = None) -> None:
     """Initialize the SQLite tables for users and authentication sessions."""
     with _DB_LOCK:
-        conn = _get_connection()
+        conn = _get_connection(db_file)
         try:
             with conn:
                 conn.execute("""
@@ -123,7 +124,7 @@ def register_user(name: str, email: str, password: str) -> tuple[dict[str, Any],
             with conn:
                 existing = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
                 if existing:
-                    raise ValueError("An account with this email address already exists")
+                    raise ValueError("An account with this email address already exists / អ៊ីមែលនេះមានរួចហើយ")
 
                 conn.execute(
                     "INSERT INTO users (id, name, email, password_hash, created_at, avatar_color) VALUES (?, ?, ?, ?, ?, ?)",

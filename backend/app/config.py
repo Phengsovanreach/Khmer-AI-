@@ -25,6 +25,8 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
+        "https://khmer-ai-16c.pages.dev",
+        "https://1a4828c3.khmer-ai-16c.pages.dev",
     ]
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
