@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: khmer-translator-backend
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: standard
+    healthCheckPath: /api/ready
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: CORS_ORIGINS
+        value: "https://khmer-ai-16c.pages.dev,https://f50e2d76.khmer-ai-16c.pages.dev,http://localhost:5173"
+      - key: WHISPER_DEVICE
+        value: "cpu"
+      - key: WHISPER_COMPUTE_TYPE
+        value: "int8"
