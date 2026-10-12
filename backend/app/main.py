@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from .auth import (
     register_user,
@@ -121,10 +121,95 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    allow_origin_regex=r"^https://.*\.pages\.dev$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def get_current_user_optional(
+    request: Request,
+    authorization: str | None = Header(None),
+) -> Optional[dict[str, Any]]:
+    """Resolves authenticated user from Bearer Authorization header or HttpOnly auth_token cookie."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    elif authorization and authorization.strip():
+        token = authorization.strip()
+    if not token:
+        token = request.cookies.get("auth_token")
+    if not token:
+        return None
+    return get_user_by_token(token)
+
+
+def get_current_user(
+    current_user: Optional[dict[str, Any]] = Depends(get_current_user_optional),
+) -> dict[str, Any]:
+    """Strict dependency requiring authenticated user; raises HTTP 401 if missing or invalid."""
+    if not current_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required / តម្រូវឲ្យចូលប្រើប្រាស់ជាមុនសិន",
+        )
+    return current_user
+
+
+def check_job_access(job: dict[str, Any], user: Optional[dict[str, Any]]) -> None:
+    """Enforces account data isolation. If a job has a user_id, only the owner can access it."""
+    job_user_id = job.get("user_id")
+    if job_user_id:
+        if not user or user.get("id") != job_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You do not have permission to access this project / គ្មានសិទ្ធិចូលប្រើប្រាស់គម្រោងនេះទេ",
+            )
+
+
+@app.middleware("http")
+async def enforce_job_data_isolation(request: Request, call_next):
+    """
+    Security Middleware enforcing multi-tenant account data isolation.
+    Guarantees private job resources cannot be inspected, modified, or deleted across accounts.
+    """
+    path = request.url.path
+    job_id = None
+    if path.startswith("/api/jobs/"):
+        sub = path[len("/api/jobs/"):]
+        candidate = sub.split("/")[0]
+        if candidate and candidate != "import-url":
+            job_id = candidate
+    elif path.startswith("/api/transcription/jobs/"):
+        sub = path[len("/api/transcription/jobs/"):]
+        candidate = sub.split("/")[0]
+        if candidate:
+            job_id = candidate
+
+    if job_id:
+        job = get_job(job_id)
+        if job and job.get("user_id"):
+            token = None
+            auth_header = request.headers.get("authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+            elif auth_header and auth_header.strip():
+                token = auth_header.strip()
+            if not token:
+                token = request.cookies.get("auth_token")
+
+            user = get_user_by_token(token) if token else None
+            if not user or user["id"] != job["user_id"]:
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={
+                        "detail": "Forbidden: You do not have permission to access this project / គ្មានសិទ្ធិចូលប្រើប្រាស់គម្រោងនេះទេ"
+                    },
+                )
+
+    return await call_next(request)
+
 
 # Concurrency limiter to prevent CPU/RAM exhaustion on low-memory systems (3.3 GiB RAM)
 TRANSCRIPTION_SEMAPHORE = asyncio.Semaphore(1)
@@ -239,15 +324,29 @@ async def ready(response: Response):
 # =============================================================================
 
 @app.post("/api/auth/register", response_model=AuthResponse)
-async def api_register(req: RegisterRequest):
-    """Register a new user account with PBKDF2 hashed password and create session."""
+async def api_register(req: RegisterRequest, request: Request, response: Response):
+    """Register a new user account with Argon2id hashed password, set HttpOnly cookie, and create session."""
     if not req.terms_accepted:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="សូមយល់ព្រមលើលក្ខខណ្ឌប្រើប្រាស់ / You must agree to the Terms and Privacy Policy",
         )
     try:
-        user_dict, token = register_user(req.name, req.email, req.password)
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+        user_dict, token = register_user(
+            req.name, req.email, req.password, client_ip=client_ip, user_agent=user_agent
+        )
+        is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        response.set_cookie(
+            key="auth_token",
+            value=token,
+            max_age=30 * 86400,
+            httponly=True,
+            secure=is_https,
+            samesite="none" if is_https else "lax",
+            path="/",
+        )
         return AuthResponse(
             success=True,
             user=UserProfile(**user_dict),
@@ -265,10 +364,29 @@ async def api_register(req: RegisterRequest):
 
 
 @app.post("/api/auth/login", response_model=AuthResponse)
-async def api_login(req: LoginRequest):
-    """Authenticate existing user credentials and return a secure session token."""
+async def api_login(req: LoginRequest, request: Request, response: Response):
+    """Authenticate existing user credentials via Argon2id, create session, and issue secure cookie."""
     try:
-        user_dict, token = login_user(req.email, req.password, remember_me=req.remember_me)
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+        user_dict, token = login_user(
+            req.email,
+            req.password,
+            remember_me=req.remember_me,
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+        is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+        max_age = 30 * 86400 if req.remember_me else 86400
+        response.set_cookie(
+            key="auth_token",
+            value=token,
+            max_age=max_age,
+            httponly=True,
+            secure=is_https,
+            samesite="none" if is_https else "lax",
+            path="/",
+        )
         return AuthResponse(
             success=True,
             user=UserProfile(**user_dict),
@@ -286,23 +404,28 @@ async def api_login(req: LoginRequest):
 
 
 @app.get("/api/auth/me", response_model=AuthStatusResponse)
-async def api_get_me(authorization: str | None = Header(None)):
-    """Retrieve current authenticated user profile from session token."""
-    if not authorization:
-        return AuthStatusResponse(authenticated=False, user=None)
-    token = authorization.replace("Bearer ", "").strip()
-    user_dict = get_user_by_token(token)
+async def api_get_me(request: Request, authorization: str | None = Header(None)):
+    """Retrieve current authenticated user profile from Bearer token or HttpOnly cookie."""
+    user_dict = get_current_user_optional(request, authorization)
     if not user_dict:
         return AuthStatusResponse(authenticated=False, user=None)
     return AuthStatusResponse(authenticated=True, user=UserProfile(**user_dict))
 
 
 @app.post("/api/auth/logout")
-async def api_logout(authorization: str | None = Header(None)):
-    """Revoke session token upon user logout."""
-    if authorization:
-        token = authorization.replace("Bearer ", "").strip()
+async def api_logout(request: Request, response: Response, authorization: str | None = Header(None)):
+    """Revoke session token and clear authentication cookie upon user logout."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    elif authorization and authorization.strip():
+        token = authorization.strip()
+    if not token:
+        token = request.cookies.get("auth_token")
+    if token:
         revoke_session(token)
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+    response.delete_cookie(key="auth_token", path="/", samesite="none" if is_https else "lax", secure=is_https)
     return {"success": True, "message": "បានចាកចេញដោយជោគជ័យ / Logged out successfully"}
 
 
@@ -645,6 +768,8 @@ async def get_upload_status(upload_id: str):
 
 @app.post("/api/upload/complete", response_model=JobResponse)
 async def complete_chunked_upload(
+    request: Request,
+    authorization: str | None = Header(None),
     upload_id: str = Form(None),
     source_language: str = Form(None),
     target_language: str = Form(None),
@@ -652,6 +777,7 @@ async def complete_chunked_upload(
     payload: UploadCompleteRequest | None = None,
 ):
     """Assembles received chunks, validates media with ffprobe, and initializes the translation job."""
+    current_user = get_current_user_optional(request, authorization)
     eff_upload_id = upload_id or (payload.upload_id if payload else None)
     if not eff_upload_id:
         raise HTTPException(
@@ -717,6 +843,7 @@ async def complete_chunked_upload(
 
     job = {
         "id": job_id,
+        "user_id": current_user["id"] if current_user else None,
         "filename": original_name,
         "name": (eff_name.strip() if eff_name and eff_name.strip() else Path(original_name).stem),
         "status": "uploaded",
@@ -751,6 +878,8 @@ async def cancel_chunked_upload(upload_id: str):
 
 @app.post("/api/upload", response_model=JobResponse)
 async def upload_direct_media(
+    request: Request,
+    authorization: str | None = Header(None),
     video: UploadFile | None = File(None),
     file: UploadFile | None = File(None),
     source_language: str = Form(default="auto"),
@@ -758,6 +887,7 @@ async def upload_direct_media(
     name: str | None = Form(default=None),
 ):
     """Unified direct upload endpoint compatible with both 'video' and 'file' multipart fields."""
+    current_user = get_current_user_optional(request, authorization)
     media_file = video or file
     if not media_file:
         raise HTTPException(
@@ -768,6 +898,7 @@ async def upload_direct_media(
 
     job = {
         "id": job_id,
+        "user_id": current_user["id"] if current_user else None,
         "filename": original_name,
         "name": (name.strip() if name and name.strip() else Path(original_name).stem),
         "status": "uploaded",
@@ -793,15 +924,19 @@ async def upload_direct_media(
 
 @app.post("/api/jobs", response_model=JobResponse)
 async def create_job(
+    request: Request,
+    authorization: str | None = Header(None),
     video: UploadFile = File(...),
     source_language: str = Form(default="auto"),
     target_language: str = Form(default="km"),
     name: str | None = Form(default=None),
 ):
+    current_user = get_current_user_optional(request, authorization)
     job_id, original_name, target_path, duration = await _save_upload_and_validate(video)
 
     job = {
         "id": job_id,
+        "user_id": current_user["id"] if current_user else None,
         "filename": original_name,
         "name": (name.strip() if name and name.strip() else Path(original_name).stem),
         "status": "uploaded",
@@ -826,7 +961,7 @@ async def create_job(
 
 
 @app.post("/api/jobs/import-url", response_model=JobResponse)
-async def import_media_from_url(request: Request):
+async def import_media_from_url(request: Request, authorization: str | None = Header(None)):
     """
     Safely imports media from a valid URL.
     Supports both JSON payloads and Form-encoded data, direct media links (.mp4, .webm, .wav, etc.) and supported platforms via yt-dlp where permitted.
@@ -932,8 +1067,10 @@ async def import_media_from_url(request: Request):
             detail=f"Imported media validation failed: {exc}",
         )
 
+    current_user = get_current_user_optional(request, authorization)
     job = {
         "id": job_id,
+        "user_id": current_user["id"] if current_user else None,
         "filename": Path(clean_url.split("?")[0]).name or f"{job_id}.mp4",
         "name": f"Imported Video ({job_id})",
         "status": "uploaded",
@@ -958,20 +1095,32 @@ async def import_media_from_url(request: Request):
 
 
 @app.get("/api/jobs")
-async def get_all_jobs():
-    return [safe_job(j) for j in list_jobs()]
+async def get_all_jobs(request: Request, authorization: str | None = Header(None)):
+    current_user = get_current_user_optional(request, authorization)
+    if current_user:
+        jobs = list_jobs(user_id=current_user["id"], include_unowned=False)
+    else:
+        jobs = [j for j in list_jobs() if not j.get("user_id")]
+    return [safe_job(j) for j in jobs]
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobResponse)
-async def get_job_by_id(job_id: str):
+async def get_job_by_id(job_id: str, request: Request, authorization: str | None = Header(None)):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    current_user = get_current_user_optional(request, authorization)
+    check_job_access(job, current_user)
     return safe_job(job)
 
 
 @app.delete("/api/jobs/{job_id}")
-async def remove_job(job_id: str):
+async def remove_job(job_id: str, request: Request, authorization: str | None = Header(None)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    current_user = get_current_user_optional(request, authorization)
+    check_job_access(job, current_user)
     success = delete_job(job_id)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -2604,23 +2753,35 @@ async def get_dubbed_audio(job_id: str, download: bool = Query(default=False)):
 # =========================================================================
 
 SETTINGS_FILE = (BASE_DIR / "app_settings.json").resolve()
+USER_SETTINGS_DIR = (BASE_DIR / "user_settings").resolve()
+USER_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/api/settings", response_model=AppSettings)
-async def get_app_settings():
+async def get_app_settings(request: Request, authorization: str | None = Header(None)):
+    current_user = get_current_user_optional(request, authorization)
+    target_file = (USER_SETTINGS_DIR / f"{current_user['id']}_settings.json") if current_user else SETTINGS_FILE
+    if target_file.exists():
+        try:
+            data = json.loads(target_file.read_text(encoding="utf-8"))
+            return AppSettings(**data)
+        except Exception as exc:
+            logger.warning("Failed to load user settings, fallback: %s", exc)
     if SETTINGS_FILE.exists():
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             return AppSettings(**data)
-        except Exception as exc:
-            logger.warning("Failed to load settings file, using defaults: %s", exc)
+        except Exception:
+            pass
     return AppSettings()
 
 
 @app.put("/api/settings", response_model=AppSettings)
-async def update_app_settings(settings_payload: AppSettings):
+async def update_app_settings(settings_payload: AppSettings, request: Request, authorization: str | None = Header(None)):
+    current_user = get_current_user_optional(request, authorization)
+    target_file = (USER_SETTINGS_DIR / f"{current_user['id']}_settings.json") if current_user else SETTINGS_FILE
     try:
-        SETTINGS_FILE.write_text(json.dumps(settings_payload.model_dump(), indent=2), encoding="utf-8")
+        target_file.write_text(json.dumps(settings_payload.model_dump(), indent=2), encoding="utf-8")
         return settings_payload
     except Exception as exc:
         logger.error("Failed to save settings: %s", exc)

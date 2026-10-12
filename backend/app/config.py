@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     ]
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
+    auth_db_path: str = "auth.db"
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -45,5 +46,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 UPLOAD_DIR = (BASE_DIR / settings.upload_dir).resolve()
 OUTPUT_DIR = (BASE_DIR / settings.output_dir).resolve()
 JOBS_FILE = (BASE_DIR / settings.jobs_file).resolve()
+AUTH_DB_PATH = Path(settings.auth_db_path) if Path(settings.auth_db_path).is_absolute() else (BASE_DIR / settings.auth_db_path).resolve()
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)

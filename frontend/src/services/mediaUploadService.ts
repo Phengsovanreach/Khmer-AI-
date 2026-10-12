@@ -8,6 +8,8 @@
  * © 2026 Phengsovanreach. All rights reserved.
  */
 
+import { AuthService } from './authService';
+
 export type UploadPhase =
   | 'idle'
   | 'preparing'
@@ -217,9 +219,11 @@ export class MediaUploadController {
     try {
       // 1. Initialize Chunked Upload on Server
       const initUrl = `${this.options.apiBase}/api/upload/init`;
+      const authHeaders = AuthService.getAuthHeaders();
       const initRes = await fetch(initUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        credentials: 'include',
         body: JSON.stringify({
           filename: this.file.name,
           file_size: this.file.size,
@@ -272,7 +276,8 @@ export class MediaUploadController {
       const completeUrl = `${this.options.apiBase}/api/upload/complete`;
       const compRes = await fetch(completeUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        credentials: 'include',
         body: JSON.stringify({
           upload_id: this.uploadId,
           source_language: this.options.sourceLang || 'auto',
@@ -434,6 +439,11 @@ export class MediaUploadController {
       };
 
       xhr.open('POST', `${this.options.apiBase}/api/upload/chunk`);
+      xhr.withCredentials = true;
+      const token = AuthService.getToken();
+      if (token) {
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      }
       xhr.timeout = 45000; // 45 seconds per chunk
       xhr.send(fd);
     });
@@ -482,8 +492,12 @@ export class MediaUploadController {
 
     try {
       // Refresh status from server to sync uploaded chunk indices
+      const authHeaders = AuthService.getAuthHeaders();
       if (this.uploadId) {
-        const statusRes = await fetch(`${this.options.apiBase}/api/upload/status/${this.uploadId}`);
+        const statusRes = await fetch(`${this.options.apiBase}/api/upload/status/${this.uploadId}`, {
+          headers: { ...authHeaders },
+          credentials: 'include',
+        });
         if (statusRes.ok) {
           const statusData = await statusRes.json();
           this.uploadedChunks = new Set(statusData.uploaded_chunks || []);
@@ -506,7 +520,8 @@ export class MediaUploadController {
       const completeUrl = `${this.options.apiBase}/api/upload/complete`;
       const compRes = await fetch(completeUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        credentials: 'include',
         body: JSON.stringify({
           upload_id: this.uploadId,
           source_language: this.options.sourceLang || 'auto',
@@ -550,8 +565,11 @@ export class MediaUploadController {
 
     if (this.uploadId) {
       try {
+        const authHeaders = AuthService.getAuthHeaders();
         await fetch(`${this.options.apiBase}/api/upload/${this.uploadId}`, {
           method: 'DELETE',
+          headers: { ...authHeaders },
+          credentials: 'include',
         });
       } catch {
         // ignore server delete errors on cancellation

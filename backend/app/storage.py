@@ -87,6 +87,8 @@ def safe_job(job: dict[str, Any]) -> dict[str, Any]:
     if "stages" not in cleaned or not isinstance(cleaned["stages"], dict):
         cleaned["stages"] = {}
 
+    cleaned["user_id"] = job.get("user_id")
+
     return cleaned
 
 
@@ -124,13 +126,20 @@ def get_job(job_id: str) -> dict[str, Any] | None:
         return dict(job) if job else None
 
 
-def list_jobs() -> list[dict[str, Any]]:
+def list_jobs(user_id: str | None = None, include_unowned: bool = False) -> list[dict[str, Any]]:
     with _STORAGE_LOCK:
         disk_jobs = _load_from_disk()
         for k, v in disk_jobs.items():
             if k not in _JOBS:
                 _JOBS[k] = v
         jobs = list(_JOBS.values())
+
+    if user_id is not None:
+        if include_unowned:
+            jobs = [j for j in jobs if j.get("user_id") == user_id or not j.get("user_id")]
+        else:
+            jobs = [j for j in jobs if j.get("user_id") == user_id]
+
     return sorted(jobs, key=lambda j: j.get("created_at", ""), reverse=True)
 
 

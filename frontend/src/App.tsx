@@ -130,6 +130,19 @@ export const getApiBase = (): string => {
 
 let API = getApiBase();
 
+export const authFetch = async (url: string, init: RequestInit = {}): Promise<Response> => {
+  const token = AuthService.getToken();
+  const headers = new Headers(init.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  return fetch(url, {
+    ...init,
+    headers,
+    credentials: 'include',
+  });
+};
+
 const SUPPORTED_EXTS = [
   '.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v',
   '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac', '.opus'
@@ -513,7 +526,7 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
     if (!active) return;
     setIsExporting(true);
     try {
-      const res = await fetch(`${API}/api/jobs/${active.id}/export-video`, {
+      const res = await authFetch(`${API}/api/jobs/${active.id}/export-video`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1068,7 +1081,7 @@ export default function App() {
 
     autoSaveTimerRef.current = setTimeout(async () => {
       try {
-        const res = await fetch(`${API}/api/jobs/${active.id}/transcript`, {
+        const res = await authFetch(`${API}/api/jobs/${active.id}/transcript`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ transcript: editedSegments }),
@@ -1092,12 +1105,12 @@ export default function App() {
   const loadState = async () => {
     try {
       const [resJobs, resCaps, resModels, resVoices, resSettings, resLangs] = await Promise.all([
-        fetch(`${API}/api/jobs`),
-        fetch(`${API}/api/capabilities`),
-        fetch(`${API}/api/transcription/models`),
-        fetch(`${API}/api/dubbing/voices`),
-        fetch(`${API}/api/settings`),
-        fetch(`${API}/api/languages`),
+        authFetch(`${API}/api/jobs`),
+        authFetch(`${API}/api/capabilities`),
+        authFetch(`${API}/api/transcription/models`),
+        authFetch(`${API}/api/dubbing/voices`),
+        authFetch(`${API}/api/settings`),
+        authFetch(`${API}/api/languages`),
       ]);
 
       if (resJobs.ok) {
@@ -1138,7 +1151,7 @@ export default function App() {
 
   const handleRenameProject = async (jobId: string, newName: string) => {
     try {
-      const res = await fetch(`${API}/api/jobs/${jobId}`, {
+      const res = await authFetch(`${API}/api/jobs/${jobId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newName }),
@@ -1154,7 +1167,7 @@ export default function App() {
   };
 
   const handleSaveSettings = async (newSettings: AppSettings) => {
-    const res = await fetch(`${API}/api/settings`, {
+    const res = await authFetch(`${API}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newSettings),
@@ -1171,7 +1184,7 @@ export default function App() {
     const tgt = tgtLang || selectedTargetLang || 'km';
     setNotice(`កំពុងបកប្រែ (${src} → ${tgt}) តាមប្រព័ន្ធ Universal Translation (Zero Ollama)...`);
     try {
-      const res = await fetch(`${API}/api/jobs/${jobId}/translate?source_language=${encodeURIComponent(src)}&target_language=${encodeURIComponent(tgt)}`, {
+      const res = await authFetch(`${API}/api/jobs/${jobId}/translate?source_language=${encodeURIComponent(src)}&target_language=${encodeURIComponent(tgt)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
@@ -1190,7 +1203,7 @@ export default function App() {
   const handleUpdateSpeakers = async (updatedSpeakers: SpeakerProfile[]) => {
     if (!active) return;
     try {
-      const res = await fetch(`${API}/api/jobs/${active.id}/speakers`, {
+      const res = await authFetch(`${API}/api/jobs/${active.id}/speakers`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ speakers: updatedSpeakers }),
@@ -1207,7 +1220,7 @@ export default function App() {
   const handleMergeSpeakers = async (keepSpeakerId: string, mergeSpeakerId: string) => {
     if (!active) return;
     try {
-      const res = await fetch(`${API}/api/jobs/${active.id}/speakers/merge`, {
+      const res = await authFetch(`${API}/api/jobs/${active.id}/speakers/merge`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keep_speaker_id: keepSpeakerId, merge_speaker_id: mergeSpeakerId }),
@@ -1226,7 +1239,7 @@ export default function App() {
   const handleSplitSpeaker = async (speakerId: string, segmentIds: number[], newSpeakerName?: string) => {
     if (!active) return;
     try {
-      const res = await fetch(`${API}/api/jobs/${active.id}/speakers/split`, {
+      const res = await authFetch(`${API}/api/jobs/${active.id}/speakers/split`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ speaker_id: speakerId, segment_ids: segmentIds, new_speaker_name: newSpeakerName }),
@@ -1248,7 +1261,7 @@ export default function App() {
     setError('');
     setStatusStage('កំពុងទាញយកវីដេអូពី URL (Safe Media Downloader)...');
     try {
-      const res = await fetch(`${API}/api/jobs/import-url`, {
+      const res = await authFetch(`${API}/api/jobs/import-url`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1324,7 +1337,7 @@ export default function App() {
         if (!pollInterval && isMounted) {
           pollInterval = setInterval(async () => {
             try {
-              const res = await fetch(`${API}/api/jobs/${active.id}`);
+              const res = await authFetch(`${API}/api/jobs/${active.id}`);
               if (res.ok) {
                 const freshJob: Job = await res.json();
                 if (isMounted) {
@@ -1344,7 +1357,7 @@ export default function App() {
     } catch {
       pollInterval = setInterval(async () => {
         try {
-          const res = await fetch(`${API}/api/jobs/${active.id}`);
+          const res = await authFetch(`${API}/api/jobs/${active.id}`);
           if (res.ok) {
             const freshJob: Job = await res.json();
             if (isMounted) {
@@ -1371,7 +1384,7 @@ export default function App() {
   const handleCancelJob = async (jobId: string) => {
     try {
       setBusy(true);
-      const res = await fetch(`${API}/api/jobs/${jobId}/cancel`, { method: 'POST' });
+      const res = await authFetch(`${API}/api/jobs/${jobId}/cancel`, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         if (data.job) setActive(data.job);
@@ -1390,7 +1403,7 @@ export default function App() {
       setBusy(true);
       setError('');
       setNotice('កំពុងចាប់ផ្តើមដំណើរការឡើងវិញ...');
-      const res = await fetch(`${API}/api/jobs/${jobId}/retry?model=${encodeURIComponent(selectedModel)}`, {
+      const res = await authFetch(`${API}/api/jobs/${jobId}/retry?model=${encodeURIComponent(selectedModel)}`, {
         method: 'POST',
       });
       const data = await res.json();
@@ -1560,7 +1573,7 @@ export default function App() {
         auto_translate: autoTranslate ? 'true' : 'false',
         auto_dub: autoDub ? 'true' : 'false',
       });
-      const res = await fetch(`${API}/api/jobs/${jobId}/transcribe?${params.toString()}`, {
+      const res = await authFetch(`${API}/api/jobs/${jobId}/transcribe?${params.toString()}`, {
         method: 'POST',
       });
       const data = await res.json();
@@ -1635,7 +1648,7 @@ export default function App() {
     setBusy(true);
     setError('');
     try {
-      const res = await fetch(`${API}/api/jobs/${active.id}/transcript`, {
+      const res = await authFetch(`${API}/api/jobs/${active.id}/transcript`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ segments: editedSegments }),
@@ -1697,7 +1710,7 @@ export default function App() {
   const handleDeleteJob = async (jobId: string) => {
     if (!confirm('តើអ្នកពិតជាចង់លុបគម្រោងនេះមែនទេ?')) return;
     try {
-      const res = await fetch(`${API}/api/jobs/${jobId}`, { method: 'DELETE' });
+      const res = await authFetch(`${API}/api/jobs/${jobId}`, { method: 'DELETE' });
       if (res.ok) {
         if (active?.id === jobId) {
           setActive(null);
@@ -1745,6 +1758,7 @@ export default function App() {
         dark={dark}
         onSuccess={(user) => {
           setCurrentUser(user);
+          void loadState();
         }}
       />
     );
@@ -1947,6 +1961,8 @@ export default function App() {
               onClick={() => {
                 AuthService.logout();
                 setCurrentUser(null);
+                setJobs([]);
+                setActive(null);
               }}
               title="ចាកចេញ (Sign Out)"
               aria-label="Sign Out"

@@ -1,6 +1,6 @@
 /**
  * Angkor Nexus — Production Authentication Service
- * Manages API calls, cryptographic token storage, and session validation.
+ * Manages API calls, cryptographic token storage, HttpOnly cookies, and session validation.
  */
 
 export interface UserProfile {
@@ -9,6 +9,10 @@ export interface UserProfile {
   full_name?: string;
   email: string;
   created_at: string;
+  updated_at?: string;
+  last_login_at?: string;
+  status?: string;
+  email_verified?: boolean;
   avatar_color: string;
 }
 
@@ -35,6 +39,11 @@ export class AuthService {
 
   public static getToken(): string | null {
     return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY);
+  }
+
+  public static getAuthHeaders(): Record<string, string> {
+    const token = this.getToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   public static setSession(token: string, user: UserProfile, rememberMe: boolean = true): void {
@@ -76,12 +85,13 @@ export class AuthService {
     const res = await fetch(`${this.getApiBase()}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ name, email, password, terms_accepted: true }),
     });
 
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data.detail || data.message || 'Registration failed');
+      throw new Error(data.detail || data.message || 'Registration failed / ការចុះឈ្មោះបរាជ័យ');
     }
 
     this.setSession(data.token, data.user, true);
@@ -96,12 +106,13 @@ export class AuthService {
     const res = await fetch(`${this.getApiBase()}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ email, password, remember_me: rememberMe }),
     });
 
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data.detail || data.message || 'Invalid email or password');
+      throw new Error(data.detail || data.message || 'Invalid email or password / អ៊ីមែល ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ');
     }
 
     this.setSession(data.token, data.user, rememberMe);
@@ -110,28 +121,30 @@ export class AuthService {
 
   public static async verifySession(): Promise<UserProfile | null> {
     const token = this.getToken();
-    if (!token) return null;
 
     try {
+      const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
       const res = await fetch(`${this.getApiBase()}/api/auth/me`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers,
+        credentials: 'include',
       });
 
       if (!res.ok) {
-        this.clearSession();
+        if (token) this.clearSession();
         return null;
       }
 
       const data = await res.json();
       if (data.authenticated && data.user) {
-        // Refresh cached user
-        const isLocal = !!localStorage.getItem(TOKEN_KEY);
-        this.setSession(token, data.user, isLocal);
+        if (token) {
+          const isLocal = !!localStorage.getItem(TOKEN_KEY);
+          this.setSession(token, data.user, isLocal);
+        } else {
+          sessionStorage.setItem(USER_KEY, JSON.stringify(data.user));
+        }
         return data.user;
       }
-      this.clearSession();
+      if (token) this.clearSession();
       return null;
     } catch {
       // In offline / network glitch, fallback to cached user if available
@@ -141,17 +154,15 @@ export class AuthService {
 
   public static async logout(): Promise<void> {
     const token = this.getToken();
-    if (token) {
-      try {
-        await fetch(`${this.getApiBase()}/api/auth/logout`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-      } catch {
-        // Ignore network failure on logout
-      }
+    try {
+      const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+      await fetch(`${this.getApiBase()}/api/auth/logout`, {
+        method: 'POST',
+        headers,
+        credentials: 'include',
+      });
+    } catch {
+      // Ignore network failure on logout
     }
     this.clearSession();
   }

@@ -494,6 +494,10 @@ class UserProfile(BaseModel):
     email: str
     created_at: str
     avatar_color: str
+    status: str = "active"
+    email_verified: bool = True
+    updated_at: str | None = None
+    last_login_at: str | None = None
 
 
 class AuthResponse(BaseModel):
