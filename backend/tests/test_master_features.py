@@ -1,3 +1,195 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.storage import save_job, get_job, delete_job
+from app.translation import translate_text_to_khmer
+from app.dubbing import get_available_khmer_voices
+
+client = TestClient(app)
+
+def test_available_voices():
+    voices = get_available_khmer_voices()
+    assert len(voices) >= 2
+    voice_ids = [v["id"] for v in voices]
+    assert "km-KH-PisethNeural" in voice_ids
+    assert "km-KH-SreymomNeural" in voice_ids
+
+    response = client.get("/api/dubbing/voices")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) >= 2
+    assert any(v["id"] == "km-KH-PisethNeural" for v in data)
+
+def test_app_settings_lifecycle():
+    get_res = client.get("/api/settings")
+    assert get_res.status_code == 200
+    original_settings = get_res.json()
+    assert "ui_language" in original_settings
+
+    # Update settings
+    updated_payload = {
+        **original_settings,
+        "ui_language": "km",
+        "default_tts_voice": "km-KH-SreymomNeural",
+        "subtitle_font_size": "large",
+    }
+    put_res = client.put("/api/settings", json=updated_payload)
+    assert put_res.status_code == 200
+    saved = put_res.json()
+    assert saved["ui_language"] == "km"
+    assert saved["default_tts_voice"] == "km-KH-SreymomNeural"
+    assert saved["subtitle_font_size"] == "large"
+
+def test_subtitle_editor_pro_operations():
+    job_id = "test-subtitle-pro-job"
+    sample_segments = [
+        {"id": 0, "start": 0.0, "end": 2.0, "text": "Hello world"},
+        {"id": 1, "start": 2.5, "end": 5.0, "text": "Welcome to Khmer Translator"},
+        {"id": 2, "start": 5.5, "end": 8.0, "text": "Enjoy high quality subtitles"},
+    ]
+    save_job({
+        "id": job_id,
+        "name": "Initial Project Name",
+        "filename": "demo.mp4",
+        "status": "transcribed",
+        "transcript": sample_segments,
+        "translation": [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "សួស្តីពិភពលោក"},
+            {"id": 1, "start": 2.5, "end": 5.0, "text": "សូមស្វាគមន៍មកកាន់ Khmer Translator"},
+            {"id": 2, "start": 5.5, "end": 8.0, "text": "រីករាយជាមួយ Subtitle គុណភាពខ្ពស់"},
+        ],
+    })
+
+    try:
+        # 1. Project rename
+        rename_res = client.patch(f"/api/jobs/{job_id}", json={"name": "Renamed Khmer Project"})
+        assert rename_res.status_code == 200
+        assert rename_res.json()["name"] == "Renamed Khmer Project"
+
+        # 2. Split segment #1 at 3.5s
+        split_res = client.post(f"/api/jobs/{job_id}/transcript/split", json={
+            "segment_id": 1,
+            "split_time": 3.5,
+            "text_part1": "Welcome to",
+            "text_part2": "Khmer Translator",
+        })
+        assert split_res.status_code == 200
+        transcript = split_res.json()["transcript"]
+        assert len(transcript) == 4
+        assert transcript[1]["text"] == "Welcome to"
+        assert transcript[1]["end"] == 3.5
+        assert transcript[2]["text"] == "Khmer Translator"
+        assert transcript[2]["start"] == 3.5
+        assert transcript[2]["end"] == 5.0
+
+        # 3. Merge segments #2 and #3 back together
+        merge_res = client.post(f"/api/jobs/{job_id}/transcript/merge", json={
+            "segment_id_1": 2,
+            "segment_id_2": 3,
+        })
+        assert merge_res.status_code == 200
+        transcript = merge_res.json()["transcript"]
+        assert len(transcript) == 3
+        assert transcript[1]["start"] == 2.5
+        assert transcript[1]["end"] == 5.0
+        assert "Welcome to Khmer Translator" in transcript[1]["text"]
+
+
+        # 4. Insert new segment after #2
+        insert_res = client.post(f"/api/jobs/{job_id}/transcript/insert", json={
+            "after_segment_id": 2,
+            "segment": {
+                "id": 99,
+                "start": 8.2,
+                "end": 10.0,
+                "text": "Thank you for watching",
+            },
+        })
+        assert insert_res.status_code == 200
+        transcript = insert_res.json()["transcript"]
+        assert len(transcript) == 4
+        assert transcript[3]["text"] == "Thank you for watching"
+
+        # 5. Delete segment
+        del_res = client.delete(f"/api/jobs/{job_id}/transcript/3")
+        assert del_res.status_code == 200
+        transcript = del_res.json()["transcript"]
+        assert len(transcript) == 3
+
+        # 6. Timestamp validation: reject end <= start
+        bad_update_res = client.put(f"/api/jobs/{job_id}/transcript", json={
+            "transcript": [
+                {"id": 0, "start": 5.0, "end": 2.0, "text": "Invalid order"}
+            ]
+        })
+        assert bad_update_res.status_code in (400, 422)
+
+    finally:
+        delete_job(job_id)
+
+def test_translation_without_ollama():
+    # Direct test of translate_text_to_khmer
+    res = translate_text_to_khmer("Hello world")
+    assert isinstance(res, str)
+    assert len(res) > 0
+    # Must not throw error and should produce text
+
+def test_mix_audio_tracks(tmp_path):
+    from app.dubbing import mix_audio_tracks
+    import subprocess
+
+    orig = tmp_path / "orig.mp3"
+    speech = tmp_path / "speech.mp3"
+    out1 = tmp_path / "mixed1.mp3"
+    out2 = tmp_path / "mixed2.mp3"
+
+    # Create short 1s silent audio files
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono:d=1.0", "-c:a", "libmp3lame", str(orig)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono:d=1.0", "-c:a", "libmp3lame", str(speech)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Test with standard keyword arguments
+    res1 = mix_audio_tracks(
+        original_audio_path=orig,
+        dubbed_audio_path=speech,
+        output_mixed_path=out1,
+        voice_volume=1.0,
+        original_volume=0.2,
+    )
+    assert res1.exists()
+    assert res1.stat().st_size > 0
+
+    # Test with alias keyword arguments (the ones from the user's error)
+    res2 = mix_audio_tracks(
+        original_media_path=orig,
+        speech_audio_path=speech,
+        output_audio_path=out2,
+        speech_volume=1.0,
+        original_volume=0.2,
+    )
+    assert res2.exists()
+    assert res2.stat().st_size > 0
+
+
+def test_segment_audio_sample_endpoint(monkeypatch):
+    """Test the endpoint without depending on the external Edge TTS service."""
+    from app import dubbing
+
+    expected_audio = b"mock-mp3-audio-data-" * 12
+
+    async def fake_generate_segment_audio(
+        text,
+        voice_id="km-KH-PisethNeural",
+        emotion="neutral",
+        rate_pct=0,
+    ):
+        assert text == "សួស្តីកម្ពុជា"
+        assert voice_id == "km-KH-PisethNeural"
+        assert emotion == "happy"
+        assert rate_pct == 0
+        return expected_audio
+
+    # The route imports this function when the request is handled, so patch
     # the function on the app.dubbing module before making the request.
     monkeypatch.setattr(dubbing, "generate_segment_audio", fake_generate_segment_audio)
 
@@ -126,3 +318,9 @@ def test_export_video_auto_dubbing_validation(tmp_path):
             check=True,
         )
         import json
+        probe_data = json.loads(probe.stdout)
+        stream_types = [s["codec_type"] for s in probe_data.get("streams", [])]
+        assert "video" in stream_types, "Exported MP4 must contain video stream"
+        assert "audio" in stream_types, "Exported MP4 must contain audible audio stream"
+    finally:
+        delete_job(job_id)
