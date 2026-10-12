@@ -462,6 +462,15 @@ class UploadCompleteRequest(BaseModel):
     name: str | None = None
 
 
+class URLImportRequest(BaseModel):
+    url: str
+    source_language: str = "auto"
+    target_language: str = "km"
+    auto_diarize: bool = True
+    auto_translate: bool = True
+    auto_dub: bool = False
+
+
 # =============================================================================
 # ANGKOR NEXUS AUTHENTICATION SCHEMAS
 # =============================================================================

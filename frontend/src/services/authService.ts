@@ -25,8 +25,12 @@ const TOKEN_KEY = 'khmer_ai_auth_token';
 const USER_KEY = 'khmer_ai_auth_user';
 
 export class AuthService {
-  private static getApiBase(): string {
-    return import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+  public static getApiBase(): string {
+    const custom = typeof window !== 'undefined' ? localStorage.getItem('khmer_ai_api_url') : null;
+    if (custom && custom.trim()) {
+      return custom.trim().replace(/\/+$/, '');
+    }
+    return (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
   }
 
   public static getToken(): string | null {

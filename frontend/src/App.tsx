@@ -120,7 +120,15 @@ export type {
   PipelineStageConfig,
 };
 
-const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+export const getApiBase = (): string => {
+  const custom = typeof window !== 'undefined' ? localStorage.getItem('khmer_ai_api_url') : null;
+  if (custom && custom.trim()) {
+    return custom.trim().replace(/\/+$/, '');
+  }
+  return (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+};
+
+let API = getApiBase();
 
 const SUPPORTED_EXTS = [
   '.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v',
@@ -951,13 +959,32 @@ export default function App() {
 
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => AuthService.getCachedUser());
   const [isAuthChecking, setIsAuthChecking] = useState<boolean>(true);
+  const [apiBaseUrl, setApiBaseUrl] = useState<string>(getApiBase);
+  API = apiBaseUrl;
+
+  const [customApiInput, setCustomApiInput] = useState<string>(() => {
+    return localStorage.getItem('khmer_ai_api_url') || (apiBaseUrl.startsWith('http://127.0.0.1') ? '' : apiBaseUrl);
+  });
+  const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+  const isLocalApi = apiBaseUrl.startsWith('http://127.0.0.1') || apiBaseUrl.startsWith('http://localhost');
+  const needsBackendUrl = isHttps && isLocalApi;
+
+  const handleSaveCustomApi = async (url: string) => {
+    const clean = url.trim().replace(/\/+$/, '');
+    if (!clean) return;
+    localStorage.setItem('khmer_ai_api_url', clean);
+    setApiBaseUrl(clean);
+    API = clean;
+    setNotice('បានរក្សាទុក និងភ្ជាប់ទៅកាន់ Backend Server ដោយជោគជ័យ!');
+    await loadState();
+  };
 
   useEffect(() => {
     AuthService.verifySession().then((user) => {
       setCurrentUser(user);
       setIsAuthChecking(false);
     });
-  }, []);
+  }, [apiBaseUrl]);
 
   useEffect(() => {
     localStorage.setItem('khmer_translator_theme', dark ? 'dark' : 'light');
@@ -1238,7 +1265,16 @@ export default function App() {
       setImportUrl('');
       setShowUrlImport(false);
       await loadState();
-      setNotice('បាន Import និងដំណើរការវីដេអូពី URL ដោយជោគជ័យ!');
+      setNotice('បាន Import វីដេអូពី URL ដោយជោគជ័យ! កំពុងចាប់ផ្តើមបកប្រែ...');
+      await runTranscription(
+        data.id,
+        selectedModel,
+        selectedSourceLang,
+        selectedTargetLang,
+        true,
+        true,
+        workflowMode === 'beginner'
+      );
     } catch (err: any) {
       setError(err.message || 'បរាជ័យក្នុងការ Import ពី URL');
     } finally {
@@ -2041,6 +2077,65 @@ export default function App() {
               }}
             />
           </div>
+
+          {/* Production Backend URL Connection Banner if on HTTPS but pointing to localhost */}
+          {needsBackendUrl && (
+            <motion.div
+              initial={{ opacity: 0, y: -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              style={{
+                background: 'linear-gradient(135deg, rgba(214,180,106,0.18), rgba(17,26,46,0.95))',
+                border: '1px solid rgba(214,180,106,0.5)',
+                borderRadius: 12,
+                padding: '14px 18px',
+                marginBottom: 20,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 14,
+                flexWrap: 'wrap',
+                boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 260, flex: 1 }}>
+                <AlertCircle size={22} style={{ color: '#D6B46A', flexShrink: 0 }} />
+                <div>
+                  <b style={{ color: '#D6B46A', fontSize: 13, display: 'block' }}>
+                    ទាមទារភ្ជាប់ Backend Server សម្រាប់ Cloudflare / Phone
+                  </b>
+                  <p style={{ margin: '4px 0 0', color: 'var(--text-secondary)', fontSize: 11, lineHeight: 1.5 }}>
+                    ដើម្បី Upload វីដេអូ និងបកប្រែលើទូរស័ព្ទដៃ សូមបញ្ចូល Render API URL របស់អ្នក (ឧទាហរណ៍៖ <code>https://khmer-ai.onrender.com</code>)។
+                  </p>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', width: '100%', maxWidth: 460 }}>
+                <input
+                  type="url"
+                  placeholder="https://your-service.onrender.com"
+                  value={customApiInput}
+                  onChange={(e) => setCustomApiInput(e.target.value)}
+                  style={{
+                    flex: 1,
+                    padding: '9px 12px',
+                    borderRadius: 8,
+                    border: '1px solid #D6B46A',
+                    background: '#0B1020',
+                    color: '#fff',
+                    fontSize: 12,
+                    outline: 'none',
+                  }}
+                />
+                <button
+                  type="button"
+                  className="primary-btn"
+                  style={{ padding: '9px 16px', fontSize: 11, whiteSpace: 'nowrap' }}
+                  onClick={() => handleSaveCustomApi(customApiInput)}
+                >
+                  <Check size={14} /> ភ្ជាប់ (Connect)
+                </button>
+              </div>
+            </motion.div>
+          )}
 
           {/* Animated Notice & Error Alerts */}
           <AnimatePresence>

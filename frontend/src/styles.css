@@ -806,7 +806,9 @@ label,
     bottom: 0 !important;
     width: 280px !important;
     max-width: 85vw !important;
-    height: 100vh !important;
+    height: 100% !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
     z-index: 1000 !important;
     transform: translateX(-100%) !important;
     visibility: hidden !important;
@@ -814,12 +816,21 @@ label,
     transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.28s ease, visibility 0.28s !important;
     box-shadow: none !important;
     overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+    overscroll-behavior-y: contain !important;
+    padding: 16px 14px calc(90px + env(safe-area-inset-bottom, 32px)) 14px !important;
+    box-sizing: border-box !important;
   }
   .sidebar.mobile-open {
     transform: translateX(0) !important;
     visibility: visible !important;
     pointer-events: auto !important;
     box-shadow: 12px 0 45px rgba(0, 0, 0, 0.85) !important;
+  }
+  .sidebar.mobile-open .sidebar-bottom {
+    margin-top: 24px !important;
+    flex-shrink: 0 !important;
+    padding-bottom: 28px !important;
   }
   .sidebar.mobile-open .brand > div:nth-child(2),
   .sidebar.mobile-open .workspace-pill,
@@ -5914,7 +5925,9 @@ html, body {
     bottom: 0 !important;
     width: 280px !important;
     max-width: 85vw !important;
-    height: 100vh !important;
+    height: 100% !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
     z-index: 1000 !important;
     transform: translateX(-100%) !important;
     visibility: hidden !important;
@@ -5922,8 +5935,11 @@ html, body {
     transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.28s ease, visibility 0.28s !important;
     box-shadow: none !important;
     overflow-y: auto !important;
-    padding: 20px 14px !important;
+    -webkit-overflow-scrolling: touch !important;
+    overscroll-behavior-y: contain !important;
+    padding: 16px 14px calc(90px + env(safe-area-inset-bottom, 32px)) 14px !important;
     margin: 0 !important;
+    box-sizing: border-box !important;
   }
 
   .sidebar.mobile-open {
@@ -5931,6 +5947,12 @@ html, body {
     visibility: visible !important;
     pointer-events: auto !important;
     box-shadow: 12px 0 45px rgba(0, 0, 0, 0.85) !important;
+  }
+
+  .sidebar.mobile-open .sidebar-bottom {
+    margin-top: 24px !important;
+    flex-shrink: 0 !important;
+    padding-bottom: 28px !important;
   }
 
   .sidebar .brand > div:nth-child(2),
@@ -6015,7 +6037,7 @@ html, body {
   }
 
   .content {
-    padding: 16px 14px !important;
+    padding: 16px 14px calc(80px + env(safe-area-inset-bottom, 30px)) 14px !important;
     max-width: 100% !important;
   }
 

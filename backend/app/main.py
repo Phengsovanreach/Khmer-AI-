@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 
@@ -826,16 +826,39 @@ async def create_job(
 
 
 @app.post("/api/jobs/import-url", response_model=JobResponse)
-async def import_media_from_url(
-    url: str = Form(...),
-    source_language: str = Form(default="auto"),
-    target_language: str = Form(default="km"),
-):
+async def import_media_from_url(request: Request):
     """
     Safely imports media from a valid URL.
-    Supports direct media links (.mp4, .webm, .wav, etc.) and supported platforms via yt-dlp where permitted.
+    Supports both JSON payloads and Form-encoded data, direct media links (.mp4, .webm, .wav, etc.) and supported platforms via yt-dlp where permitted.
     """
-    clean_url = url.strip()
+    content_type = request.headers.get("content-type", "").lower()
+    raw_url: str = ""
+    source_language: str = "auto"
+    target_language: str = "km"
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            raw_url = str(body.get("url", ""))
+            source_language = str(body.get("source_language", "auto"))
+            target_language = str(body.get("target_language", "km"))
+        except Exception:
+            pass
+    else:
+        try:
+            form = await request.form()
+            raw_url = str(form.get("url", ""))
+            source_language = str(form.get("source_language", "auto"))
+            target_language = str(form.get("target_language", "km"))
+        except Exception:
+            pass
+
+    clean_url = raw_url.strip()
+    if not clean_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="URL is required. សូមបញ្ចូលតំណភ្ជាប់វីដេអូ ឬ URL មេឌៀ។",
+        )
     if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
