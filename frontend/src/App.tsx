@@ -47,6 +47,7 @@ import {
   StopCircle,
   Subtitles,
   Sun,
+  LogOut,
   Trash2,
   Users,
   Video,
@@ -57,6 +58,8 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 
+import { AngkorNexusAuth } from './components/AngkorNexusAuth';
+import { AuthService, AuthUser } from './services/authService';
 import { SubtitleEditorPro } from './components/SubtitleEditorPro';
 import { KhmerDubbingStudio } from './components/KhmerDubbingStudio';
 import { ProjectHistoryPanel } from './components/ProjectHistoryPanel';
@@ -946,6 +949,16 @@ export default function App() {
     return true;
   });
 
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => AuthService.getCachedUser());
+  const [isAuthChecking, setIsAuthChecking] = useState<boolean>(true);
+
+  useEffect(() => {
+    AuthService.verifySession().then((user) => {
+      setCurrentUser(user);
+      setIsAuthChecking(false);
+    });
+  }, []);
+
   useEffect(() => {
     localStorage.setItem('khmer_translator_theme', dark ? 'dark' : 'light');
     document.documentElement.classList.toggle('dark', dark);
@@ -1677,6 +1690,30 @@ export default function App() {
     ? ['.mp4', '.mkv', '.mov', '.avi', '.webm'].some((e) => active.filename.endsWith(e))
     : false;
 
+  if (isAuthChecking) {
+    return (
+      <div className={dark ? 'app dark' : 'app light'} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0B1020', color: '#D6B46A' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+          <img src="/logo.png" alt="Khmer Heritage" style={{ width: 64, height: 64, filter: 'drop-shadow(0 0 16px rgba(214,180,106,0.5))' }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.95rem', fontWeight: 600, letterSpacing: '0.05em' }}>
+            <span className="live-dot" /> កំពុងផ្ទៀងផ្ទាត់គណនី ANGKOR NEXUS...
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AngkorNexusAuth
+        dark={dark}
+        onSuccess={(user) => {
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
+
   return (
     <div className={dark ? 'app dark' : 'app light'}>
       {/* Authentic Cambodian Cultural Ambient Backdrop */}
@@ -1842,12 +1879,45 @@ export default function App() {
             </div>
           </div>
 
-          <div className="profile">
-            <img src="/logo.png" alt="Khmer Heritage Emblem" className="profile-emblem" />
-            <div>
-              <b>Khmer Speech AI</b>
-              <small>{COPYRIGHT_OWNER}</small>
+          <div className="profile" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '10px 12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+              <div style={{
+                width: 34,
+                height: 34,
+                borderRadius: '50%',
+                background: 'linear-gradient(135deg, #D6B46A, #927044)',
+                color: '#0B1020',
+                fontWeight: 700,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: '0.88rem',
+                flexShrink: 0,
+                boxShadow: '0 0 10px rgba(214,180,106,0.3)'
+              }}>
+                {currentUser?.full_name?.charAt(0)?.toUpperCase() || 'U'}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <b style={{ display: 'block', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: 110, fontSize: '0.85rem' }}>
+                  {currentUser?.full_name || 'Khmer AI'}
+                </b>
+                <small style={{ display: 'block', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: 110, opacity: 0.7, fontSize: '0.72rem' }}>
+                  {currentUser?.email || COPYRIGHT_OWNER}
+                </small>
+              </div>
             </div>
+            <button
+              className="icon-btn"
+              onClick={() => {
+                AuthService.logout();
+                setCurrentUser(null);
+              }}
+              title="ចាកចេញ (Sign Out)"
+              aria-label="Sign Out"
+              style={{ color: '#D6B46A', padding: 6, flexShrink: 0 }}
+            >
+              <LogOut size={16} />
+            </button>
           </div>
         </div>
       </aside>

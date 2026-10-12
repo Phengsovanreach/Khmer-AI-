@@ -462,3 +462,41 @@ class UploadCompleteRequest(BaseModel):
     name: str | None = None
 
 
+# =============================================================================
+# ANGKOR NEXUS AUTHENTICATION SCHEMAS
+# =============================================================================
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    terms_accepted: bool = True
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    remember_me: bool = False
+
+
+class UserProfile(BaseModel):
+    id: str
+    name: str
+    email: str
+    created_at: str
+    avatar_color: str
+
+
+class AuthResponse(BaseModel):
+    success: bool = True
+    user: UserProfile
+    token: str
+    message: str = ""
+
+
+class AuthStatusResponse(BaseModel):
+    authenticated: bool
+    user: UserProfile | None = None
+
+
+

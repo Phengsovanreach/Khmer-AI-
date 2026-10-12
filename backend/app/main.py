@@ -13,10 +13,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 
+from .auth import (
+    register_user,
+    login_user,
+    get_user_by_token,
+    revoke_session,
+)
 from .config import BASE_DIR, OUTPUT_DIR, UPLOAD_DIR, settings
 from .diarization import diarize_and_profile_audio
 from .dubbing import (
@@ -36,6 +42,8 @@ from .languages import (
 )
 from .schemas import (
     AppSettings,
+    AuthResponse,
+    AuthStatusResponse,
     CapabilitiesResponse,
     DictionaryEntry,
     DictionaryListResponse,
@@ -45,6 +53,7 @@ from .schemas import (
     JobResponse,
     LanguageInfo,
     LanguagesResponse,
+    LoginRequest,
     ModelInfo,
     ModelsResponse,
     PreviewInfoResponse,
@@ -54,6 +63,8 @@ from .schemas import (
     ProofreadJobResponse,
     ProofreadSampleRequest,
     ReadinessResponse,
+    RegisterRequest,
+    UserProfile,
     SegmentAudioSampleRequest,
     SpeakerMergeRequest,
     SpeakerProfile,
@@ -221,6 +232,74 @@ async def ready(response: Response):
         active_jobs=active_count,
         checks=checks,
     )
+
+
+# =============================================================================
+# ANGKOR NEXUS AUTHENTICATION ENDPOINTS
+# =============================================================================
+
+@app.post("/api/auth/register", response_model=AuthResponse)
+async def api_register(req: RegisterRequest):
+    """Register a new user account with PBKDF2 hashed password and create session."""
+    try:
+        user_dict, token = register_user(req.name, req.email, req.password)
+        return AuthResponse(
+            success=True,
+            user=UserProfile(**user_dict),
+            token=token,
+            message="គណនីត្រូវបានបង្កើតដោយជោគជ័យ / Account created successfully",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        logger.error("Registration error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ការចុះឈ្មោះបរាជ័យ សូមព្យាយាមម្តងទៀត / Registration failed. Please try again.",
+        )
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def api_login(req: LoginRequest):
+    """Authenticate existing user credentials and return a secure session token."""
+    try:
+        user_dict, token = login_user(req.email, req.password, remember_me=req.remember_me)
+        return AuthResponse(
+            success=True,
+            user=UserProfile(**user_dict),
+            token=token,
+            message="ចូលប្រើប្រាស់បានជោគជ័យ / Logged in successfully",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+    except Exception as exc:
+        logger.error("Login error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ការផ្ទៀងផ្ទាត់បរាជ័យ / Authentication failed.",
+        )
+
+
+@app.get("/api/auth/me", response_model=AuthStatusResponse)
+async def api_get_me(authorization: str | None = Header(None)):
+    """Retrieve current authenticated user profile from session token."""
+    if not authorization:
+        return AuthStatusResponse(authenticated=False, user=None)
+    token = authorization.replace("Bearer ", "").strip()
+    user_dict = get_user_by_token(token)
+    if not user_dict:
+        return AuthStatusResponse(authenticated=False, user=None)
+    return AuthStatusResponse(authenticated=True, user=UserProfile(**user_dict))
+
+
+@app.post("/api/auth/logout")
+async def api_logout(authorization: str | None = Header(None)):
+    """Revoke session token upon user logout."""
+    if authorization:
+        token = authorization.replace("Bearer ", "").strip()
+        revoke_session(token)
+    return {"success": True, "message": "បានចាកចេញដោយជោគជ័យ / Logged out successfully"}
+
 
 
 @app.get("/api/system/diagnostics", response_model=SystemDiagnosticsResponse)

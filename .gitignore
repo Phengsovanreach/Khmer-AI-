@@ -41,9 +41,13 @@ backend/uploads/*
 backend/outputs/*
 !backend/outputs/.gitkeep
 
-# Local job database containing user session history
+# Local job and auth database containing user session history
 backend/jobs.json
 backend/jobs.json.tmp
+*.db
+*.sqlite
+*.sqlite3
+backend/*.db
 
 # Backup folders
 _backups/

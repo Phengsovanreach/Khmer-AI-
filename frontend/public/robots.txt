@@ -1,0 +1,8 @@
+# robots.txt for Khmer Translator (Khmer AI)
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /auth/
+Disallow: /dashboard/
+
+Sitemap: https://khmer-ai-16c.pages.dev/sitemap.xml
