@@ -1,0 +1,13 @@
+{
+  "ui_language": "km",
+  "default_model": "base",
+  "default_source_lang": "auto",
+  "default_target_lang": "km",
+  "default_tts_voice": "km-KH-SreymomNeural",
+  "subtitle_font_size": "large",
+  "subtitle_position": "bottom",
+  "theme": "dark",
+  "reduced_motion": false,
+  "cultural_background_mode": "vibrant",
+  "show_celestial_angel": true
+}

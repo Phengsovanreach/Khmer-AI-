@@ -1,0 +1,40 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: khmer-translator-backend:2.0
+    container_name: khmer-translator-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=Khmer Translator API
+      - APP_VERSION=2.0.0
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+      - HOST=0.0.0.0
+      - PORT=8000
+      - UPLOAD_DIR=uploads
+      - OUTPUT_DIR=outputs
+      - JOBS_FILE=jobs.json
+      - MAX_UPLOAD_MB=2048
+      - DEFAULT_WHISPER_MODEL=tiny
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173
+    volumes:
+      - media_uploads:/app/uploads
+      - media_outputs:/app/outputs
+      - jobs_data:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  media_uploads:
+  media_outputs:
+  jobs_data:

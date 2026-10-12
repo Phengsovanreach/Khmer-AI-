@@ -1,0 +1,2242 @@
+from __future__ import annotations
+import asyncio
+import json
+import logging
+import os
+import platform
+import shutil
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+
+from .config import BASE_DIR, OUTPUT_DIR, UPLOAD_DIR, settings
+from .diarization import diarize_and_profile_audio
+from .dubbing import (
+    generate_dubbed_audio_track,
+    generate_speech_sample,
+    get_available_khmer_voices,
+    get_available_voices,
+    mix_audio_tracks,
+)
+from .languages import (
+    SUPPORTED_LANGUAGES,
+    get_language_by_code,
+    get_source_languages,
+    get_supported_languages,
+    get_target_languages,
+    normalize_whisper_code,
+)
+from .schemas import (
+    AppSettings,
+    CapabilitiesResponse,
+    DictionaryEntry,
+    DictionaryListResponse,
+    DubbingRequest,
+    HealthResponse,
+    JobProgressResponse,
+    JobResponse,
+    LanguageInfo,
+    LanguagesResponse,
+    ModelInfo,
+    ModelsResponse,
+    PreviewInfoResponse,
+    ProjectUpdateRequest,
+    ProofreadApplyRequest,
+    ProofreadJobRequest,
+    ProofreadJobResponse,
+    ProofreadSampleRequest,
+    ReadinessResponse,
+    SegmentAudioSampleRequest,
+    SpeakerMergeRequest,
+    SpeakerProfile,
+    SpeakerSplitRequest,
+    SpeakerUpdateRequest,
+    SubtitleInsertRequest,
+    SubtitleMergeRequest,
+    SubtitleSplitRequest,
+    SystemDiagnosticsResponse,
+    TranscriptSegment,
+    TranscriptUpdateRequest,
+    VideoExportRequest,
+    VoiceInfo,
+)
+from .khmer_nlp import dictionary_manager, khmer_proofreader, normalize_khmer_unicode
+from .storage import (
+    add_job_listener,
+    delete_job,
+    get_job,
+    list_jobs,
+    publish_job_update,
+    remove_job_listener,
+    safe_job,
+    save_job,
+    update_job,
+)
+from .transcription import (
+    ALLOWED_EXTENSIONS,
+    AVAILABLE_MODELS,
+    build_srt_content,
+    build_txt_content,
+    build_vtt_content,
+    extract_audio_stream,
+    get_available_models,
+    probe_media_file,
+    render_video_with_subtitles,
+    transcribe_media,
+)
+from .translation import translate_segments, translate_segments_to_khmer, translate_single_line
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title=settings.app_name,
+    version="2.0.0",
+    description="Multilingual AI Video Translation, Subtitle & Voice Dubbing Studio",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Concurrency limiter to prevent CPU/RAM exhaustion on low-memory systems (3.3 GiB RAM)
+TRANSCRIPTION_SEMAPHORE = asyncio.Semaphore(1)
+ACTIVE_CANCELLATIONS: set[str] = set()
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def get_system_memory_info() -> tuple[int, int]:
+    """Returns (total_mb, available_mb) using procfs or standard os sysconf."""
+    try:
+        meminfo_path = Path("/proc/meminfo")
+        if meminfo_path.exists():
+            mem = {}
+            for line in meminfo_path.read_text().splitlines():
+                parts = line.split(":")
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    mem[key] = int(val)
+            total_mb = mem.get("MemTotal", 0) // 1024
+            avail_mb = mem.get("MemAvailable", mem.get("MemFree", 0)) // 1024
+            return total_mb, avail_mb
+    except Exception:
+        pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+        total_mb = (page_size * total_pages) // (1024 * 1024)
+        avail_mb = (page_size * avail_pages) // (1024 * 1024)
+        return total_mb, avail_mb
+    except Exception:
+        return 4096, 2048
+
+
+def get_disk_free_mb(path: Path) -> int:
+    try:
+        st = os.statvfs(path)
+        return (st.f_bavail * st.f_frsize) // (1024 * 1024)
+    except Exception:
+        return 10240
+
+
+@app.get("/api/health", response_model=HealthResponse)
+def health():
+    return HealthResponse(status="ok", app=settings.app_name, version=settings.app_version)
+
+
+@app.get("/api/ready", response_model=ReadinessResponse)
+async def ready(response: Response):
+    """Production readiness probe for Kubernetes, Docker, or systemd."""
+    ffmpeg_ok = command_exists("ffmpeg")
+    ffprobe_ok = command_exists("ffprobe")
+    try:
+        import faster_whisper  # noqa: F401
+        whisper_ok = True
+    except Exception:
+        whisper_ok = False
+
+    try:
+        import edge_tts  # noqa: F401
+        tts_ok = True
+    except Exception:
+        tts_ok = False
+
+    # Check directory writability
+    storage_writable = False
+    try:
+        test_file = UPLOAD_DIR / f".readiness_test_{uuid.uuid4().hex}"
+        test_file.write_text("ok")
+        test_file.unlink(missing_ok=True)
+        storage_writable = True
+    except Exception:
+        storage_writable = False
+
+    active_count = len([j for j in list_jobs() if j.get("status") in ("processing", "uploading", "transcribing", "dubbing", "exporting")])
+    checks = {
+        "ffmpeg": ffmpeg_ok,
+        "ffprobe": ffprobe_ok,
+        "faster_whisper": whisper_ok,
+        "tts": tts_ok,
+        "storage_writable": storage_writable,
+    }
+
+    is_ready = ffmpeg_ok and ffprobe_ok and storage_writable
+    if not is_ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return ReadinessResponse(
+        status="ready" if is_ready else "degraded",
+        app=settings.app_name,
+        version=settings.app_version,
+        ffmpeg=ffmpeg_ok,
+        ffprobe=ffprobe_ok,
+        faster_whisper=whisper_ok,
+        tts=tts_ok,
+        storage_writable=storage_writable,
+        active_jobs=active_count,
+        checks=checks,
+    )
+
+
+@app.get("/api/system/diagnostics", response_model=SystemDiagnosticsResponse)
+async def system_diagnostics():
+    """Returns safe, sanitized diagnostic information for user troubleshooting without secrets."""
+    total_mem, avail_mem = get_system_memory_info()
+    free_disk = get_disk_free_mb(UPLOAD_DIR)
+
+    try:
+        import faster_whisper  # noqa: F401
+        whisper_ok = True
+    except Exception:
+        whisper_ok = False
+
+    try:
+        import edge_tts  # noqa: F401
+        tts_ok = True
+    except Exception:
+        tts_ok = False
+
+    sanitized_cors = [str(o) for o in (settings.cors_origins if isinstance(settings.cors_origins, list) else settings.cors_origins.split(","))]
+    active_count = len([j for j in list_jobs() if j.get("status") in ("processing", "uploading", "transcribing", "dubbing", "exporting")])
+
+    return SystemDiagnosticsResponse(
+        app_name=settings.app_name,
+        app_version=settings.app_version,
+        environment=settings.environment,
+        platform=f"{platform.system()} {platform.release()} ({platform.machine()})",
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        cpu_cores=os.cpu_count() or 1,
+        memory_total_mb=total_mem,
+        memory_available_mb=avail_mem,
+        storage_free_mb=free_disk,
+        ffmpeg_available=command_exists("ffmpeg"),
+        ffprobe_available=command_exists("ffprobe"),
+        faster_whisper_available=whisper_ok,
+        tts_engine_available=tts_ok,
+        default_whisper_model=settings.default_whisper_model,
+        supported_languages_count=len(SUPPORTED_LANGUAGES),
+        concurrency_lock_active=active_count > 0,
+        sanitized_cors_origins=sanitized_cors,
+    )
+
+
+@app.get("/api/languages", response_model=LanguagesResponse)
+async def get_all_languages():
+    """Returns curated supported multilingual source and target languages."""
+    return LanguagesResponse(
+        source_languages=[LanguageInfo(**l) for l in get_source_languages()],
+        target_languages=[LanguageInfo(**l) for l in get_target_languages()],
+        default_source_lang="auto",
+        default_target_lang="km",
+    )
+
+
+@app.get("/api/capabilities", response_model=CapabilitiesResponse)
+async def capabilities():
+    try:
+        import faster_whisper  # noqa: F401
+        whisper_installed = True
+    except Exception:
+        whisper_installed = False
+
+    voices = [VoiceInfo(**v) for v in get_available_khmer_voices()]
+
+    return CapabilitiesResponse(
+        ffmpeg=command_exists("ffmpeg"),
+        ffprobe=command_exists("ffprobe"),
+        faster_whisper=whisper_installed,
+        default_model=settings.default_whisper_model,
+        available_models=[m["id"] for m in AVAILABLE_MODELS],
+        ollama=False,
+        ollama_model="",
+        ollama_models=[],
+        tts=True,
+        available_voices=voices,
+        supported_languages_count=len(SUPPORTED_LANGUAGES),
+        url_import=command_exists("yt-dlp"),
+    )
+
+
+@app.get("/api/transcription/models", response_model=ModelsResponse)
+def get_transcription_models():
+    models = [ModelInfo(**m) for m in get_available_models()]
+    return ModelsResponse(models=models, default_model=settings.default_whisper_model)
+
+
+async def _save_upload_and_validate(video: UploadFile) -> tuple[str, str, Path, float]:
+    """Helper to stream upload, validate extension and media with ffprobe."""
+    original_name = video.filename or "media.mp4"
+    ext = Path(original_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported media extension: '{ext or '(none)'}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    job_id = uuid.uuid4().hex[:12]
+    target_path = UPLOAD_DIR / f"{job_id}{ext}"
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    written = 0
+
+    try:
+        with target_path.open("wb") as out:
+            while chunk := await video.read(1024 * 1024):  # 1MB chunks
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File exceeds maximum upload limit of {settings.max_upload_mb} MB.",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        target_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error saving uploaded file: {exc}",
+        ) from exc
+
+    if written == 0:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+
+    # Validate media integrity with ffprobe
+    try:
+        probe_info = await asyncio.to_thread(probe_media_file, target_path)
+        duration = float(probe_info.get("duration", 0.0))
+    except Exception as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Media validation failed: {exc}",
+        )
+
+    return job_id, original_name, target_path, duration
+
+
+@app.post("/api/jobs", response_model=JobResponse)
+async def create_job(
+    video: UploadFile = File(...),
+    source_language: str = Form(default="auto"),
+    target_language: str = Form(default="km"),
+    name: str | None = Form(default=None),
+):
+    job_id, original_name, target_path, duration = await _save_upload_and_validate(video)
+
+    job = {
+        "id": job_id,
+        "filename": original_name,
+        "name": (name.strip() if name and name.strip() else Path(original_name).stem),
+        "status": "uploaded",
+        "stage": "queued",
+        "progress": 0,
+        "message": "ឯកសារបាន Upload ដោយជោគជ័យ។ រួចរាល់សម្រាប់ Transcribe។",
+        "created_at": utcnow(),
+        "duration_seconds": duration,
+        "source_language": source_language or "auto",
+        "target_language": target_language or "km",
+        "speakers": [],
+        "transcript": [],
+        "translation": [],
+        "error": None,
+        "stages": {},
+        "path": str(target_path),
+        "voice_settings": {},
+        "subtitle_styling": {},
+    }
+    save_job(job)
+    return safe_job(job)
+
+
+@app.post("/api/jobs/import-url", response_model=JobResponse)
+async def import_media_from_url(
+    url: str = Form(...),
+    source_language: str = Form(default="auto"),
+    target_language: str = Form(default="km"),
+):
+    """
+    Safely imports media from a valid URL.
+    Supports direct media links (.mp4, .webm, .wav, etc.) and supported platforms via yt-dlp where permitted.
+    """
+    clean_url = url.strip()
+    if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid URL scheme. Only HTTP and HTTPS URLs are permitted.",
+        )
+
+    job_id = uuid.uuid4().hex[:12]
+    out_media_file = UPLOAD_DIR / f"{job_id}.mp4"
+
+    # Strategy 1: Check if it is a direct media file
+    is_direct_media = any(clean_url.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
+
+    if is_direct_media or not command_exists("yt-dlp"):
+        try:
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                resp = await client.get(clean_url)
+                if resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Failed to fetch media from URL (HTTP {resp.status_code}).",
+                    )
+                content = resp.content
+                if len(content) > settings.max_upload_mb * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Media from URL exceeds {settings.max_upload_mb} MB limit.",
+                    )
+                out_media_file.write_bytes(content)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Direct URL download failed: {exc}. Please upload the video file directly.",
+            )
+    else:
+        # Strategy 2: yt-dlp with safe constraints
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--max-filesize", f"{settings.max_upload_mb}M",
+            "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]/best",
+            "-o", str(out_media_file),
+            clean_url,
+        ]
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
+            )
+            if proc.returncode != 0 or not out_media_file.exists():
+                err = proc.stderr[-300:] if proc.stderr else "Unknown error"
+                raise RuntimeError(err)
+        except Exception as exc:
+            out_media_file.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Platform URL import failed or is restricted: {str(exc)[:150]}. "
+                    "Please download the video to your computer and upload it directly."
+                ),
+            )
+
+    # Validate downloaded media with ffprobe
+    try:
+        probe_info = await asyncio.to_thread(probe_media_file, out_media_file)
+        duration = float(probe_info.get("duration", 0.0))
+    except Exception as exc:
+        out_media_file.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Imported media validation failed: {exc}",
+        )
+
+    job = {
+        "id": job_id,
+        "filename": Path(clean_url.split("?")[0]).name or f"{job_id}.mp4",
+        "name": f"Imported Video ({job_id})",
+        "status": "uploaded",
+        "stage": "queued",
+        "progress": 0,
+        "message": "វីដេអូត្រូវបានទាញយក និងត្រួតពិនិត្យដោយជោគជ័យ។",
+        "created_at": utcnow(),
+        "duration_seconds": duration,
+        "source_language": source_language or "auto",
+        "target_language": target_language or "km",
+        "speakers": [],
+        "transcript": [],
+        "translation": [],
+        "error": None,
+        "stages": {},
+        "path": str(out_media_file),
+        "voice_settings": {},
+        "subtitle_styling": {},
+    }
+    save_job(job)
+    return safe_job(job)
+
+
+@app.get("/api/jobs")
+async def get_all_jobs():
+    return [safe_job(j) for j in list_jobs()]
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobResponse)
+async def get_job_by_id(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return safe_job(job)
+
+
+@app.delete("/api/jobs/{job_id}")
+async def remove_job(job_id: str):
+    success = delete_job(job_id)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return {"status": "deleted", "id": job_id}
+
+
+async def _execute_transcription(
+    job: dict[str, Any],
+    model_id: str,
+    language: str | None,
+    target_language: str | None = None,
+    auto_diarize: bool = True,
+    auto_translate: bool = False,
+    auto_dub: bool = False,
+    vad_filter: bool = True,
+) -> dict[str, Any]:
+    job_id = job["id"]
+    file_path = Path(job["path"])
+    target_lang = target_language or job.get("target_language") or "km"
+
+    if not file_path.exists():
+        update_job(
+            job_id,
+            {
+                "status": "failed",
+                "stage": "failed",
+                "progress": 0,
+                "message": "Media file is missing from server storage. Please re-upload.",
+                "error": "Media file is missing from server storage. Please re-upload.",
+            },
+            persist_disk=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Media file is missing from server storage. Please re-upload.",
+        )
+
+    start_time = time.time()
+    last_update_time = [0.0]
+
+    def set_progress(
+        stage: str,
+        progress: int,
+        message: str,
+        processed_duration: float | None = None,
+        total_duration: float | None = None,
+        persist: bool = False,
+    ):
+        elapsed = round(time.time() - start_time, 1)
+        eta = None
+        if processed_duration and total_duration and processed_duration > 2.0 and total_duration > processed_duration and elapsed > 0.5:
+            rate = processed_duration / elapsed
+            if rate > 0.05:
+                eta = round((total_duration - processed_duration) / rate, 1)
+
+        stage_statuses = {
+            "validating": "completed" if progress > 5 else "active" if stage == "validating" else "pending",
+            "extracting_audio": "completed" if progress > 15 else "active" if stage == "extracting_audio" else "pending",
+            "transcribing": "completed" if progress > 85 else "active" if stage == "transcribing" else "pending",
+            "detecting_speakers": "completed" if progress > 92 else "active" if stage == "detecting_speakers" else "pending",
+            "generating_subtitles": "completed" if progress >= 98 else "active" if stage == "generating_subtitles" else "pending",
+            "completed": "completed" if progress >= 100 else "pending",
+        }
+
+        updates = {
+            "status": stage if progress < 100 else "transcribed",
+            "stage": stage,
+            "progress": min(max(int(progress), 0), 100),
+            "message": message,
+            "elapsed_seconds": elapsed,
+            "eta_seconds": eta,
+            "processed_duration": round(processed_duration, 2) if processed_duration is not None else None,
+            "duration_seconds": round(total_duration, 2) if total_duration is not None else job.get("duration_seconds"),
+            "stages": stage_statuses,
+            "error": None,
+        }
+        return update_job(job_id, updates, persist_disk=persist)
+
+    # Stage 1: Validating
+    set_progress("validating", 5, "ផ្ទៀងផ្ទាត់ឯកសារមេឌៀ (Validating media format with FFprobe)...", persist=True)
+
+    wav_path = UPLOAD_DIR / f"{job_id}_clean.wav"
+
+    async with TRANSCRIPTION_SEMAPHORE:
+        if job_id in ACTIVE_CANCELLATIONS:
+            ACTIVE_CANCELLATIONS.discard(job_id)
+            updated = update_job(
+                job_id,
+                {
+                    "status": "cancelled",
+                    "stage": "cancelled",
+                    "message": "ដំណើរការត្រូវបានបោះបង់ដោយអ្នកប្រើប្រាស់ (Cancelled by user)",
+                },
+                persist_disk=True,
+            )
+            return safe_job(updated or job)
+
+        try:
+            # Media validation with FFprobe
+            probe_info = await asyncio.to_thread(probe_media_file, file_path)
+            total_duration = float(probe_info.get("duration", 0.0)) or float(job.get("duration_seconds", 0.0) or 0.0)
+
+            if job_id in ACTIVE_CANCELLATIONS:
+                ACTIVE_CANCELLATIONS.discard(job_id)
+                updated = update_job(job_id, {"status": "cancelled", "stage": "cancelled", "message": "Cancelled by user"}, persist_disk=True)
+                return safe_job(updated or job)
+
+            # Stage 2: Audio extraction via FFmpeg
+            set_progress(
+                "extracting_audio",
+                12,
+                "ទាញយក និងសម្រួលសំឡេងជា 16kHz Mono (Extracting audio with FFmpeg)...",
+                total_duration=total_duration,
+                persist=True,
+            )
+            try:
+                extracted_wav = await asyncio.to_thread(extract_audio_stream, file_path, wav_path)
+                transcribe_input = extracted_wav
+            except Exception as extract_err:
+                logger.warning("FFmpeg extraction fallback: using original %s: %s", file_path, extract_err)
+                transcribe_input = file_path
+
+            if job_id in ACTIVE_CANCELLATIONS:
+                ACTIVE_CANCELLATIONS.discard(job_id)
+                updated = update_job(job_id, {"status": "cancelled", "stage": "cancelled", "message": "Cancelled by user"}, persist_disk=True)
+                return safe_job(updated or job)
+
+            # Stage 3: Speech transcription with faster-whisper
+            set_progress(
+                "transcribing",
+                15,
+                f"ចាប់ផ្តើមស្គាល់សំឡេងដោយ Faster-Whisper ({model_id})...",
+                total_duration=total_duration,
+                persist=True,
+            )
+
+            def on_segment(current_end: float, dur: float, seg_dict: dict[str, Any]):
+                nonlocal total_duration
+                d = dur if dur > 0 else total_duration
+                if d <= 0:
+                    d = max(current_end, 1.0)
+                total_duration = d
+                ratio = min(current_end / d, 1.0)
+                calc_progress = 15 + int(ratio * 70)  # Range 15% -> 85%
+                now = time.time()
+                if now - last_update_time[0] >= 0.3 or calc_progress >= 85:
+                    last_update_time[0] = now
+                    msg = f"ស្គាល់សំឡេង: {current_end:.1f}s / {d:.1f}s ({int(ratio * 100)}%)"
+                    set_progress("transcribing", calc_progress, msg, processed_duration=current_end, total_duration=d, persist=False)
+
+            def check_cancelled() -> bool:
+                return job_id in ACTIVE_CANCELLATIONS
+
+            whisper_lang = normalize_whisper_code(language)
+            result = await asyncio.to_thread(
+                transcribe_media,
+                file_path=transcribe_input,
+                model_id=model_id,
+                language=whisper_lang,
+                device=settings.whisper_device,
+                compute_type=settings.whisper_compute_type,
+                vad_filter=vad_filter,
+                progress_callback=on_segment,
+                cancel_check=check_cancelled,
+            )
+
+            segments = result.get("segments", [])
+            detected_src_lang = result.get("source_language")
+
+            # Stage 4: Multi-speaker Diarization & Character Profiling
+            speaker_profiles: list[dict[str, Any]] = []
+            if auto_diarize and wav_path.exists() and len(segments) > 0:
+                set_progress(
+                    "detecting_speakers",
+                    88,
+                    "វិភាគសំឡេង និងកំណត់អត្តសញ្ញាណតួអង្គនិយាយ (Detecting speakers & voice profiles)...",
+                    total_duration=total_duration,
+                    persist=True,
+                )
+                try:
+                    updated_segs, profiles = await asyncio.to_thread(
+                        diarize_and_profile_audio,
+                        wav_path=wav_path,
+                        segments=segments,
+                        target_language=target_lang,
+                    )
+                    segments = updated_segs
+                    speaker_profiles = profiles
+                except Exception as diarize_err:
+                    logger.warning("Speaker diarization fallback: %s", diarize_err)
+                    speaker_profiles = [
+                        {
+                            "id": "speaker_1",
+                            "speaker_id": "speaker_1",
+                            "name": "Speaker 1",
+                            "gender_presentation": "adult",
+                            "age_impression": "adult",
+                            "speaking_style": "conversational",
+                            "speaking_speed": "normal",
+                            "confidence": 0.85,
+                            "assigned_voice_id": "km-KH-PisethNeural",
+                            "segment_count": len(segments),
+                            "total_duration": total_duration,
+                            "sample_dialogue": [s["text"] for s in segments[:3]],
+                        }
+                    ]
+                    for s in segments:
+                        s["speaker_id"] = "speaker_1"
+
+            # Optional Auto-Translation
+            translated_segments: list[dict[str, Any]] = []
+            if (auto_translate or auto_dub) and len(segments) > 0:
+                set_progress("translating", 93, f"បកប្រែជាភាសា {target_lang}...", total_duration=total_duration, persist=True)
+                try:
+                    translated_segments = await translate_segments(
+                        segments,
+                        source_lang=detected_src_lang or language or "auto",
+                        target_lang=target_lang,
+                    )
+                    # Context-Aware Khmer Proofreading & Unicode Normalization Pipeline
+                    if target_lang == "km" and translated_segments:
+                        set_progress("translating", 95, "កំពុងផ្ទៀងផ្ទាត់អក្ខរាវិរុទ្ធ និងវេយ្យាករណ៍ភាសាខ្មែរ (Khmer Proofreading)...", total_duration=total_duration, persist=True)
+                        try:
+                            proof_out = khmer_proofreader.proofread_segments(
+                                translated_segments,
+                                source_segments=segments,
+                                auto_apply_high_confidence=True,
+                            )
+                            for s, r in zip(translated_segments, proof_out["results"]):
+                                if r.get("applied_automatically"):
+                                    s["text"] = r["suggested_khmer"]
+                        except Exception as p_err:
+                            logger.warning("Auto proofreading failed: %s", p_err)
+                except Exception as t_err:
+                    logger.warning("Auto translation failed: %s", t_err)
+
+            # Optional Auto-Dubbing
+            has_dubbed_audio = False
+            dubbed_audio_url = None
+            if auto_dub and len(segments) > 0:
+                dub_segments = translated_segments if translated_segments else segments
+                set_progress("dubbing", 96, f"កំពុងបង្កើតសំឡេង AI Dubbing ស្វ័យប្រវត្តិ ({target_lang})...", total_duration=total_duration, persist=True)
+                try:
+                    out_dubbed = OUTPUT_DIR / f"{job_id}_dubbed.mp3"
+                    raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
+                    spk_voices = {p["speaker_id"]: p["assigned_voice_id"] for p in speaker_profiles if p.get("speaker_id") and p.get("assigned_voice_id")}
+                    spk_rates = {p["speaker_id"]: p.get("speech_rate", 0) for p in speaker_profiles if p.get("speaker_id")}
+
+                    await generate_dubbed_audio_track(
+                        segments=dub_segments,
+                        output_audio_path=raw_dubbed,
+                        voice_id=speaker_profiles[0]["assigned_voice_id"] if speaker_profiles else "km-KH-PisethNeural",
+                        speaker_voices=spk_voices,
+                        speaker_rates=spk_rates,
+                        total_duration=float(total_duration or 10.0),
+                        original_media_path=wav_path,
+                        preserve_nonverbal=True,
+                    )
+
+                    if wav_path.exists():
+                        await asyncio.to_thread(
+                            mix_audio_tracks,
+                            original_audio_path=wav_path,
+                            dubbed_audio_path=raw_dubbed,
+                            output_mixed_path=out_dubbed,
+                            voice_volume=1.0,
+                            original_volume=0.85,
+                            preserve_soundtrack=True,
+                            ducking_intensity=0.35,
+                        )
+                        raw_dubbed.unlink(missing_ok=True)
+                    else:
+                        if raw_dubbed.exists():
+                            shutil.move(str(raw_dubbed), str(out_dubbed))
+
+                    if out_dubbed.exists() and out_dubbed.stat().st_size > 100:
+                        has_dubbed_audio = True
+                        dubbed_audio_url = f"/api/jobs/{job_id}/dubbed-audio"
+                except Exception as d_err:
+                    logger.warning("Auto-dubbing failed: %s", d_err)
+
+            # Stage 5: Subtitle generation
+            set_progress(
+                "generating_subtitles",
+                98,
+                "បង្កើត និងរក្សាទុកឯកសារ Subtitle SRT & Plain Text...",
+                total_duration=total_duration,
+                persist=True,
+            )
+
+            srt_content = build_srt_content(segments)
+            txt_content = build_txt_content(segments, include_timestamps=True)
+            vtt_content = build_vtt_content(segments)
+            srt_path = OUTPUT_DIR / f"{job_id}.srt"
+            txt_path = OUTPUT_DIR / f"{job_id}.txt"
+            vtt_path = OUTPUT_DIR / f"{job_id}.vtt"
+            srt_path.write_text(srt_content, encoding="utf-8")
+            txt_path.write_text(txt_content, encoding="utf-8")
+            vtt_path.write_text(vtt_content, encoding="utf-8")
+
+            # Stage 6: Completed
+            final_duration = result.get("duration") or total_duration
+            completed_job = update_job(
+                job_id,
+                {
+                    "status": "transcribed",
+                    "stage": "completed",
+                    "progress": 100,
+                    "message": "ដំណើរការស្គាល់សំឡេងបានជោគជ័យពេញលេញ (100%)",
+                    "transcript": segments,
+                    "translation": translated_segments,
+                    "speakers": speaker_profiles,
+                    "source_language": language or detected_src_lang or "auto",
+                    "detected_source_language": detected_src_lang,
+                    "target_language": target_lang,
+                    "model_used": result.get("model_used"),
+                    "duration_seconds": round(float(final_duration), 2) if final_duration else None,
+                    "processed_duration": round(float(final_duration), 2) if final_duration else None,
+                    "elapsed_seconds": round(time.time() - start_time, 1),
+                    "eta_seconds": 0.0,
+                    "output_srt_path": str(srt_path),
+                    "output_txt_path": str(txt_path),
+                    "has_dubbed_audio": has_dubbed_audio,
+                    "dubbed_audio_url": dubbed_audio_url,
+                    "error": None,
+                    "stages": {
+                        "validating": "completed",
+                        "extracting_audio": "completed",
+                        "transcribing": "completed",
+                        "detecting_speakers": "completed",
+                        "generating_subtitles": "completed",
+                        "completed": "completed",
+                    },
+                },
+                persist_disk=True,
+            )
+            return safe_job(completed_job or job)
+
+        except InterruptedError:
+            ACTIVE_CANCELLATIONS.discard(job_id)
+            updated = update_job(
+                job_id,
+                {
+                    "status": "cancelled",
+                    "stage": "cancelled",
+                    "message": "ដំណើរការត្រូវបានបោះបង់ដោយអ្នកប្រើប្រាស់ (Cancelled by user)",
+                },
+                persist_disk=True,
+            )
+            return safe_job(updated or job)
+        except Exception as exc:
+            logger.error("Job %s execution failed: %s", job_id, exc)
+            ACTIVE_CANCELLATIONS.discard(job_id)
+            failed_job = update_job(
+                job_id,
+                {
+                    "status": "failed",
+                    "stage": "failed",
+                    "message": f"Processing failed: {exc}",
+                    "error": str(exc),
+                    "stages": {"failed": "failed"},
+                },
+                persist_disk=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Speech recognition failed: {exc}",
+            ) from exc
+
+
+@app.post("/api/jobs/{job_id}/transcribe", response_model=JobResponse)
+async def transcribe_job(
+    job_id: str,
+    model: str = Query(default="tiny"),
+    language: str | None = Query(default=None),
+    target_language: str = Query(default="km"),
+    auto_diarize: bool = Query(default=True),
+    auto_translate: bool = Query(default=False),
+    auto_dub: bool = Query(default=False),
+):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    ACTIVE_CANCELLATIONS.discard(job_id)
+    return await _execute_transcription(
+        job,
+        model_id=model,
+        language=language or job.get("source_language"),
+        target_language=target_language or job.get("target_language"),
+        auto_diarize=auto_diarize,
+        auto_translate=auto_translate or auto_dub,
+        auto_dub=auto_dub,
+    )
+
+
+@app.post("/api/jobs/{job_id}/diarize", response_model=JobResponse)
+async def diarize_job(job_id: str):
+    """Manually triggers or re-runs speaker diarization and voice profiling."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    segments = job.get("transcript", [])
+    if not segments:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcribe the media before detecting speakers.")
+
+    wav_path = UPLOAD_DIR / f"{job_id}_clean.wav"
+    if not wav_path.exists():
+        media_path = _find_job_media_path(job_id, job)
+        await asyncio.to_thread(extract_audio_stream, media_path, wav_path)
+
+    target_lang = job.get("target_language", "km")
+    updated_segs, profiles = await asyncio.to_thread(
+        diarize_and_profile_audio,
+        wav_path=wav_path,
+        segments=segments,
+        target_language=target_lang,
+    )
+
+    # Sync speaker_id to translation segments if available
+    trans_segs = list(job.get("translation", []))
+    for idx, t_seg in enumerate(trans_segs):
+        if idx < len(updated_segs):
+            t_seg["speaker_id"] = updated_segs[idx].get("speaker_id")
+
+    updated = update_job(
+        job_id,
+        {
+            "transcript": updated_segs,
+            "translation": trans_segs,
+            "speakers": profiles,
+            "updated_at": utcnow(),
+        },
+        persist_disk=True,
+    )
+    return safe_job(updated or job)
+
+
+@app.put("/api/jobs/{job_id}/speakers", response_model=JobResponse)
+def update_speakers(job_id: str, payload: SpeakerUpdateRequest):
+    """Updates editable character names, assigned voices, and profiles."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    updated = update_job(
+        job_id,
+        {"speakers": [s.model_dump() for s in payload.speakers], "updated_at": utcnow()},
+        persist_disk=True,
+    )
+    return safe_job(updated or job)
+
+
+@app.post("/api/jobs/{job_id}/speakers/merge", response_model=JobResponse)
+def merge_speakers_endpoint(job_id: str, payload: SpeakerMergeRequest):
+    """Merges two speaker profiles together and reassigns dialogue segments."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    keep_id = payload.speaker_id_keep
+    merge_id = payload.speaker_id_merge
+
+    transcript = list(job.get("transcript", []))
+    for s in transcript:
+        if s.get("speaker_id") == merge_id:
+            s["speaker_id"] = keep_id
+
+    translation = list(job.get("translation", []))
+    for s in translation:
+        if s.get("speaker_id") == merge_id:
+            s["speaker_id"] = keep_id
+
+    # Filter out merged speaker from profiles and update count
+    profiles = [p for p in job.get("speakers", []) if p.get("speaker_id") != merge_id]
+    for p in profiles:
+        if p.get("speaker_id") == keep_id:
+            p["segment_count"] = sum(1 for s in transcript if s.get("speaker_id") == keep_id)
+
+    updated = update_job(
+        job_id,
+        {
+            "transcript": transcript,
+            "translation": translation,
+            "speakers": profiles,
+            "updated_at": utcnow(),
+        },
+        persist_disk=True,
+    )
+    return safe_job(updated or job)
+
+
+@app.post("/api/jobs/{job_id}/speakers/split", response_model=JobResponse)
+def split_speaker_endpoint(job_id: str, payload: SpeakerSplitRequest):
+    """Splits selected segments into a new speaker."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    existing_speakers = list(job.get("speakers", []))
+    new_spk_num = len(existing_speakers) + 1
+    new_spk_id = f"speaker_{new_spk_num}"
+    new_name = payload.new_speaker_name or f"Speaker {new_spk_num}"
+
+    target_ids = set(payload.segment_ids)
+    transcript = list(job.get("transcript", []))
+    for s in transcript:
+        if s.get("id") in target_ids:
+            s["speaker_id"] = new_spk_id
+
+    translation = list(job.get("translation", []))
+    for s in translation:
+        if s.get("id") in target_ids:
+            s["speaker_id"] = new_spk_id
+
+    new_profile = {
+        "id": new_spk_id,
+        "speaker_id": new_spk_id,
+        "name": new_name,
+        "gender_presentation": "adult",
+        "age_impression": "adult",
+        "speaking_style": "conversational",
+        "speaking_speed": "normal",
+        "confidence": 0.85,
+        "assigned_voice_id": "km-KH-PisethNeural",
+        "segment_count": len(target_ids),
+        "total_duration": 0.0,
+        "sample_dialogue": [s["text"] for s in transcript if s.get("speaker_id") == new_spk_id][:3],
+    }
+    existing_speakers.append(new_profile)
+
+    updated = update_job(
+        job_id,
+        {
+            "transcript": transcript,
+            "translation": translation,
+            "speakers": existing_speakers,
+            "updated_at": utcnow(),
+        },
+        persist_disk=True,
+    )
+    return safe_job(updated or job)
+
+
+@app.get("/api/transcription/jobs/{job_id}", response_model=JobResponse)
+def get_transcription_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return safe_job(job)
+
+
+@app.get("/api/transcription/jobs/{job_id}/result")
+def get_transcription_result(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "source_language": job.get("source_language"),
+        "target_language": job.get("target_language"),
+        "model_used": job.get("model_used"),
+        "duration_seconds": job.get("duration_seconds"),
+        "transcript": job.get("transcript", []),
+        "translation": job.get("translation", []),
+        "speakers": job.get("speakers", []),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/api/jobs/{job_id}/progress", response_model=JobProgressResponse)
+async def get_job_progress(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    safe = safe_job(job)
+    return {
+        "id": safe["id"],
+        "status": safe.get("status", "queued"),
+        "stage": safe.get("stage"),
+        "progress": safe.get("progress", 0),
+        "message": safe.get("message"),
+        "elapsed_seconds": safe.get("elapsed_seconds"),
+        "eta_seconds": safe.get("eta_seconds"),
+        "processed_duration": safe.get("processed_duration"),
+        "total_duration": safe.get("duration_seconds"),
+        "error": safe.get("error"),
+        "stages": safe.get("stages", {}),
+    }
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def job_events_stream(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    async def event_generator():
+        queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+        add_job_listener(job_id, queue)
+        try:
+            current = get_job(job_id)
+            if current:
+                yield f"data: {json.dumps(safe_job(current), ensure_ascii=False)}\n\n"
+                if current.get("status") in ("transcribed", "completed", "failed", "cancelled"):
+                    return
+
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=10.0)
+                    yield f"data: {json.dumps(safe_job(data), ensure_ascii=False)}\n\n"
+                    if data.get("status") in ("transcribed", "completed", "failed", "cancelled"):
+                        break
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    refreshed = get_job(job_id)
+                    if refreshed and refreshed.get("status") in ("transcribed", "completed", "failed", "cancelled"):
+                        yield f"data: {json.dumps(safe_job(refreshed), ensure_ascii=False)}\n\n"
+                        break
+        finally:
+            remove_job_listener(job_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/api/jobs/{job_id}/retry", response_model=JobResponse)
+async def retry_job_endpoint(job_id: str, model: str = Query(default="tiny")):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    ACTIVE_CANCELLATIONS.discard(job_id)
+    updated = update_job(
+        job_id,
+        {
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "message": "រៀបចំចាប់ផ្តើមដំណើរការឡើងវិញ (Retrying job)...",
+            "error": None,
+            "elapsed_seconds": 0.0,
+            "eta_seconds": None,
+            "processed_duration": 0.0,
+            "stages": {},
+        },
+        persist_disk=True,
+    )
+    return await _execute_transcription(
+        updated or job,
+        model_id=model,
+        language=job.get("source_language"),
+        target_language=job.get("target_language"),
+    )
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+@app.post("/api/transcription/jobs/{job_id}/cancel")
+async def cancel_transcription_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    ACTIVE_CANCELLATIONS.add(job_id)
+    updated = update_job(
+        job_id,
+        {
+            "status": "cancelled",
+            "stage": "cancelled",
+            "message": "ដំណើរការត្រូវបានបោះបង់ដោយអ្នកប្រើប្រាស់ (Cancelled by user)",
+        },
+        persist_disk=True,
+    )
+    return {"status": "cancelled", "job": safe_job(updated or job)}
+
+
+@app.patch("/api/jobs/{job_id}", response_model=JobResponse)
+async def update_project_metadata(job_id: str, payload: ProjectUpdateRequest):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    updates: dict[str, Any] = {"updated_at": utcnow()}
+    if payload.name is not None:
+        updates["name"] = payload.name.strip()
+    if payload.source_language is not None:
+        updates["source_language"] = payload.source_language
+    if payload.target_language is not None:
+        updates["target_language"] = payload.target_language
+    if payload.speakers is not None:
+        updates["speakers"] = [s.model_dump() for s in payload.speakers]
+    if payload.voice_settings is not None:
+        current_voice = dict(job.get("voice_settings", {}))
+        current_voice.update(payload.voice_settings)
+        updates["voice_settings"] = current_voice
+    if payload.subtitle_styling is not None:
+        current_style = dict(job.get("subtitle_styling", {}))
+        current_style.update(payload.subtitle_styling)
+        updates["subtitle_styling"] = current_style
+
+    updated = update_job(job_id, updates)
+    return safe_job(updated or job)
+
+
+@app.put("/api/jobs/{job_id}/transcript", response_model=JobResponse)
+def update_transcript(job_id: str, payload: TranscriptUpdateRequest, target: str = Query(default="transcript")):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    key = "translation" if target == "translation" else "transcript"
+    existing_segs = {s.get("id"): s for s in job.get(key, [])}
+
+    validated = []
+    for idx, s in enumerate(payload.segments, start=1):
+        if s.start < 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Segment #{idx} start time cannot be negative.")
+        if s.end <= s.start:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Segment #{idx} end time must be greater than start time.")
+
+        prev = existing_segs.get(s.id, {})
+        entry: dict[str, Any] = {
+            "id": idx,
+            "start": round(float(s.start), 3),
+            "end": round(float(s.end), 3),
+            "text": str(s.text).strip(),
+        }
+        spk = s.speaker_id or prev.get("speaker_id")
+        if spk:
+            entry["speaker_id"] = spk
+        conf = s.confidence if s.confidence is not None else prev.get("confidence")
+        if conf is not None:
+            entry["confidence"] = conf
+        validated.append(entry)
+
+    updated = update_job(job_id, {key: validated, "updated_at": utcnow()})
+    return safe_job(updated or job)
+
+
+@app.post("/api/jobs/{job_id}/transcript/split", response_model=JobResponse)
+def split_transcript_segment(job_id: str, payload: SubtitleSplitRequest):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    key = "translation" if payload.target == "translation" else "transcript"
+    segments = list(job.get(key, []))
+
+    idx = next((i for i, s in enumerate(segments) if s.get("id") == payload.segment_id), None)
+    if idx is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Segment #{payload.segment_id} not found")
+
+    target_seg = segments[idx]
+    orig_start = float(target_seg.get("start", 0.0))
+    orig_end = float(target_seg.get("end", 0.0))
+    spk_id = target_seg.get("speaker_id")
+
+    if not (orig_start < payload.split_time < orig_end):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Split timestamp ({payload.split_time:.2f}s) must be strictly between start ({orig_start:.2f}s) and end ({orig_end:.2f}s).",
+        )
+
+    part1 = {"id": 0, "start": orig_start, "end": round(payload.split_time, 3), "text": payload.text_part1.strip()}
+    part2 = {"id": 0, "start": round(payload.split_time, 3), "end": orig_end, "text": payload.text_part2.strip()}
+    if spk_id:
+        part1["speaker_id"] = spk_id
+        part2["speaker_id"] = spk_id
+
+    new_segments = segments[:idx] + [part1, part2] + segments[idx + 1:]
+    for i, s in enumerate(new_segments, start=1):
+        s["id"] = i
+
+    updated = update_job(job_id, {key: new_segments, "updated_at": utcnow()})
+    return safe_job(updated or job)
+
+
+@app.post("/api/jobs/{job_id}/transcript/merge", response_model=JobResponse)
+def merge_transcript_segments(job_id: str, payload: SubtitleMergeRequest):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    key = "translation" if payload.target == "translation" else "transcript"
+    segments = list(job.get(key, []))
+
+    idx1 = next((i for i, s in enumerate(segments) if s.get("id") == payload.segment_id_1), None)
+    idx2 = next((i for i, s in enumerate(segments) if s.get("id") == payload.segment_id_2), None)
+
+    if idx1 is None or idx2 is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or both segments not found")
+
+    first_idx, second_idx = sorted([idx1, idx2])
+    seg1 = segments[first_idx]
+    seg2 = segments[second_idx]
+
+    merged_text = f"{seg1.get('text', '').strip()} {seg2.get('text', '').strip()}".strip()
+    merged_seg = {
+        "id": 0,
+        "start": min(float(seg1.get("start", 0.0)), float(seg2.get("start", 0.0))),
+        "end": max(float(seg1.get("end", 0.0)), float(seg2.get("end", 0.0))),
+        "text": merged_text,
+    }
+    if seg1.get("speaker_id"):
+        merged_seg["speaker_id"] = seg1.get("speaker_id")
+
+    new_segments = [s for i, s in enumerate(segments) if i not in (first_idx, second_idx)]
+    new_segments.insert(first_idx, merged_seg)
+    new_segments.sort(key=lambda s: s.get("start", 0.0))
+    for i, s in enumerate(new_segments, start=1):
+        s["id"] = i
+
+    updated = update_job(job_id, {key: new_segments, "updated_at": utcnow()})
+    return safe_job(updated or job)
+
+
+@app.post("/api/jobs/{job_id}/transcript/insert", response_model=JobResponse)
+def insert_transcript_segment(job_id: str, payload: SubtitleInsertRequest):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    key = "translation" if payload.target == "translation" else "transcript"
+    segments = list(job.get(key, []))
+
+    new_seg: dict[str, Any] = {
+        "id": 0,
+        "start": round(float(payload.segment.start), 3),
+        "end": round(float(payload.segment.end), 3),
+        "text": payload.segment.text.strip(),
+    }
+    if payload.segment.speaker_id:
+        new_seg["speaker_id"] = payload.segment.speaker_id
+
+    if payload.after_segment_id is not None:
+        idx = next((i for i, s in enumerate(segments) if s.get("id") == payload.after_segment_id), None)
+        if idx is not None:
+            segments.insert(idx + 1, new_seg)
+        else:
+            segments.append(new_seg)
+    else:
+        segments.append(new_seg)
+
+    segments.sort(key=lambda s: s.get("start", 0.0))
+    for i, s in enumerate(segments, start=1):
+        s["id"] = i
+
+    updated = update_job(job_id, {key: segments, "updated_at": utcnow()})
+    return safe_job(updated or job)
+
+
+@app.delete("/api/jobs/{job_id}/transcript/{segment_id}", response_model=JobResponse)
+def delete_transcript_segment(job_id: str, segment_id: int, target: str = Query(default="transcript")):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    key = "translation" if target == "translation" else "transcript"
+    segments = [s for s in job.get(key, []) if s.get("id") != segment_id]
+    for i, s in enumerate(segments, start=1):
+        s["id"] = i
+
+    updated = update_job(job_id, {key: segments, "updated_at": utcnow()})
+    return safe_job(updated or job)
+
+
+@app.post("/api/jobs/{job_id}/translate", response_model=JobResponse)
+async def translate_job_endpoint(
+    job_id: str,
+    source_language: str | None = Query(default=None),
+    target_language: str | None = Query(default=None),
+):
+    """
+    Translates transcript segments into the specified target language.
+    Does NOT require Ollama or paid APIs.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not job.get("transcript"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Transcribe the media before translating it.",
+        )
+
+    src_lang = source_language or job.get("source_language") or "auto"
+    tgt_lang = target_language or job.get("target_language") or "km"
+
+    current_stages = dict(job.get("stages", {}))
+    current_stages["translating"] = "active"
+    update_job(job_id, {
+        "status": "translating",
+        "stage": "translating",
+        "progress": 70,
+        "message": f"កំពុងបកប្រែ Subtitles ទៅជា {tgt_lang}...",
+        "stages": current_stages,
+    })
+
+    try:
+        translated_segments = await translate_segments(
+            job["transcript"],
+            source_lang=src_lang,
+            target_lang=tgt_lang,
+        )
+
+        current_stages["translating"] = "completed"
+        current_stages["generating_subtitles"] = "completed"
+        updated = update_job(job_id, {
+            "status": "translated",
+            "stage": "completed",
+            "progress": 100,
+            "message": f"ការបកប្រែជាភាសា {tgt_lang} បានជោគជ័យពេញលេញ!",
+            "translation": translated_segments,
+            "target_language": tgt_lang,
+            "stages": current_stages,
+            "updated_at": utcnow(),
+        })
+        return safe_job(updated or job)
+    except Exception as exc:
+        logger.error("Translation failed for job %s: %s", job_id, exc)
+        current_stages["translating"] = "failed"
+        update_job(job_id, {
+            "status": "failed",
+            "stage": "failed",
+            "message": f"Translation failed: {exc}",
+            "error": f"Translation failed: {exc}",
+            "stages": current_stages,
+        })
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Translation failed: {exc}")
+
+
+@app.get("/api/jobs/{job_id}/subtitles.srt")
+def export_srt_file(
+    job_id: str,
+    translated: bool = Query(default=False),
+    lang: str | None = Query(default=None),
+):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    if lang == "source":
+        use_translated = False
+    elif lang == "target":
+        use_translated = True
+    else:
+        use_translated = bool(translated)
+
+    segments = job.get("translation") if use_translated else job.get("transcript")
+    if not segments:
+        segments = job.get("transcript", [])
+    if not segments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No subtitle segments available to export. Transcribe the media first.",
+        )
+
+    content = build_srt_content(segments)
+    suffix = job.get("target_language", "target") if use_translated else "source"
+    out_file = OUTPUT_DIR / f"{job_id}-{suffix}.srt"
+    out_file.write_text(content, encoding="utf-8")
+
+    filename = f"{Path(job['filename']).stem}-{suffix}.srt"
+    return FileResponse(
+        out_file,
+        media_type="application/x-subrip; charset=utf-8",
+        filename=filename,
+    )
+
+
+@app.get("/api/jobs/{job_id}/subtitles.vtt")
+def export_vtt_file(
+    job_id: str,
+    translated: bool = Query(default=False),
+    lang: str | None = Query(default=None),
+):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    if lang == "source":
+        use_translated = False
+    elif lang == "target":
+        use_translated = True
+    else:
+        use_translated = bool(translated)
+
+    segments = job.get("translation") if use_translated else job.get("transcript")
+    if not segments:
+        segments = job.get("transcript", [])
+    if not segments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No subtitle segments available to export.",
+        )
+
+    content = build_vtt_content(segments)
+    suffix = job.get("target_language", "target") if use_translated else "source"
+    out_file = OUTPUT_DIR / f"{job_id}-{suffix}.vtt"
+    out_file.write_text(content, encoding="utf-8")
+
+    filename = f"{Path(job['filename']).stem}-{suffix}.vtt"
+    return FileResponse(
+        out_file,
+        media_type="text/vtt; charset=utf-8",
+        filename=filename,
+    )
+
+
+@app.get("/api/jobs/{job_id}/transcript.txt")
+def export_txt_file(
+    job_id: str,
+    translated: bool = Query(default=False),
+    lang: str | None = Query(default=None),
+    timestamps: bool = Query(default=True),
+):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    if lang == "source":
+        use_translated = False
+    elif lang == "target":
+        use_translated = True
+    else:
+        use_translated = bool(translated)
+    segments = job.get("translation") if use_translated else job.get("transcript")
+    if not segments:
+        segments = job.get("transcript", [])
+    if not segments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No transcript text available to export.",
+        )
+
+    content = build_txt_content(segments, include_timestamps=timestamps)
+    suffix = job.get("target_language", "target") if use_translated else "source"
+    out_file = OUTPUT_DIR / f"{job_id}-{suffix}.txt"
+    out_file.write_text(content, encoding="utf-8")
+
+    filename = f"{Path(job['filename']).stem}-{suffix}.txt"
+    return FileResponse(
+        out_file,
+        media_type="text/plain; charset=utf-8",
+        filename=filename,
+    )
+
+
+def _find_job_media_path(job_id: str, job: dict[str, Any] | None = None) -> Path:
+    """Safely locates the uploaded media file for a job without path traversal."""
+    if not all(c.isalnum() or c in "-_" for c in job_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job ID format")
+
+    upload_root = UPLOAD_DIR.resolve()
+    if job and job.get("path"):
+        cand = Path(job["path"]).resolve()
+        if cand.is_file() and cand.exists():
+            return cand
+
+    for ext in ALLOWED_EXTENSIONS:
+        cand = (upload_root / f"{job_id}{ext}").resolve()
+        try:
+            cand.relative_to(upload_root)
+            if cand.is_file() and cand.exists():
+                return cand
+        except ValueError:
+            pass
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found for this job")
+
+
+def _guess_media_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    mapping = {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".m4v": "video/x-m4v",
+        ".avi": "video/x-msvideo",
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+        ".opus": "audio/opus",
+    }
+    return mapping.get(ext, "application/octet-stream")
+
+
+@app.get("/api/jobs/{job_id}/media")
+async def stream_media_file(job_id: str):
+    """Streams original uploaded audio/video file with HTTP Range support for scrub preview."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    file_path = _find_job_media_path(job_id, job)
+    media_type = _guess_media_type(file_path)
+    return FileResponse(file_path, media_type=media_type)
+
+
+@app.get("/api/jobs/{job_id}/preview-info", response_model=PreviewInfoResponse)
+async def get_preview_info(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    has_media = False
+    is_video = False
+    width = None
+    height = None
+    duration = job.get("duration_seconds")
+
+    try:
+        media_path = _find_job_media_path(job_id, job)
+        has_media = media_path.exists()
+        probe = await asyncio.to_thread(probe_media_file, media_path)
+        duration = float(probe.get("duration", 0.0)) or duration
+        is_video = media_path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+    except Exception:
+        pass
+
+    rendered_file = (OUTPUT_DIR / f"{job_id}_rendered.mp4").resolve()
+    has_rendered = rendered_file.exists() and rendered_file.stat().st_size > 0
+    rendered_size = rendered_file.stat().st_size if has_rendered else None
+    rendered_duration = None
+
+    if has_rendered:
+        try:
+            r_probe = await asyncio.to_thread(probe_media_file, rendered_file)
+            rendered_duration = float(r_probe.get("duration", 0.0))
+        except Exception:
+            rendered_duration = duration
+
+    dubbed_file = (OUTPUT_DIR / f"{job_id}_dubbed.mp3").resolve()
+    has_dubbed = dubbed_file.exists() and dubbed_file.stat().st_size > 0
+
+    return PreviewInfoResponse(
+        job_id=job_id,
+        filename=job.get("filename", "media"),
+        name=job.get("name"),
+        is_video=is_video,
+        duration_seconds=duration,
+        width=width,
+        height=height,
+        has_media_file=has_media,
+        media_url=f"/api/jobs/{job_id}/media",
+        source_language=job.get("source_language"),
+        target_language=job.get("target_language", "km"),
+        has_transcript=len(job.get("transcript", [])) > 0,
+        has_translation=len(job.get("translation", [])) > 0,
+        speakers_count=len(job.get("speakers", [])),
+        has_rendered_video=has_rendered,
+        rendered_video_url=f"/api/jobs/{job_id}/rendered-video" if has_rendered else None,
+        has_dubbed_audio=has_dubbed,
+        dubbed_audio_url=f"/api/jobs/{job_id}/dubbed-audio" if has_dubbed else None,
+        rendered_video_size_bytes=rendered_size,
+        rendered_video_duration=rendered_duration,
+        srt_source_url=f"/api/jobs/{job_id}/subtitles.srt?lang=source",
+        srt_khmer_url=f"/api/jobs/{job_id}/subtitles.srt?lang=target",
+        vtt_source_url=f"/api/jobs/{job_id}/subtitles.vtt?lang=source",
+        vtt_khmer_url=f"/api/jobs/{job_id}/subtitles.vtt?lang=target",
+        txt_source_url=f"/api/jobs/{job_id}/transcript.txt?lang=source",
+        txt_khmer_url=f"/api/jobs/{job_id}/transcript.txt?lang=target",
+    )
+
+
+@app.post("/api/jobs/{job_id}/export-video", response_model=JobResponse)
+async def export_rendered_video(job_id: str, payload: VideoExportRequest = VideoExportRequest()):
+    """
+    Renders the final video with burned-in (hardsubbed) subtitles and optional dubbed audio track using FFmpeg.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # Select subtitles: prioritize translation if available, otherwise transcript
+    if payload.subtitle_source == "translation" and job.get("translation"):
+        segments = job["translation"]
+    elif payload.subtitle_source == "transcript" and job.get("transcript"):
+        segments = job["transcript"]
+    elif job.get("translation"):
+        segments = job["translation"]
+    elif job.get("transcript"):
+        segments = job["transcript"]
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No transcript or translation available to burn into video. Transcribe the media first.",
+        )
+
+    media_path = _find_job_media_path(job_id, job)
+
+    # Check for dubbed audio if requested
+    dubbed_audio_path = None
+    should_include_dub = payload.include_dubbed_audio and payload.audio_mode != "original"
+    if should_include_dub:
+        candidate_audio = (OUTPUT_DIR / f"{job_id}_dubbed.mp3").resolve()
+        # If candidate audio does not exist or is invalid, auto-synthesize on-demand!
+        if not (candidate_audio.exists() and candidate_audio.stat().st_size > 500):
+            logger.info("Dubbed audio track missing or invalid for job %s. Auto-generating before export...", job_id)
+            speaker_voices = {}
+            speaker_rates = {}
+            for spk in job.get("speakers", []):
+                spk_id = spk.get("speaker_id")
+                if spk_id:
+                    if spk.get("assigned_voice_id"):
+                        speaker_voices[spk_id] = spk["assigned_voice_id"]
+                    if spk.get("speech_rate"):
+                        speaker_rates[spk_id] = spk["speech_rate"]
+
+            raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
+            await generate_dubbed_audio_track(
+                segments=segments,
+                output_audio_path=raw_dubbed,
+                voice_id=job.get("voice_settings", {}).get("voice_id") or "km-KH-PisethNeural",
+                speaker_voices=speaker_voices,
+                speaker_rates=speaker_rates,
+                total_duration=float(job.get("duration_seconds", 10.0) or 10.0),
+                original_media_path=media_path,
+                preserve_nonverbal=getattr(payload, "preserve_nonverbal", True),
+            )
+
+            if payload.audio_mode == "mixed" and media_path and media_path.exists():
+                await asyncio.to_thread(
+                    mix_audio_tracks,
+                    original_audio_path=media_path,
+                    dubbed_audio_path=raw_dubbed,
+                    output_mixed_path=candidate_audio,
+                    voice_volume=payload.voice_volume,
+                    original_volume=payload.original_volume,
+                    preserve_soundtrack=payload.preserve_soundtrack,
+                    ducking_intensity=payload.ducking_intensity,
+                )
+                raw_dubbed.unlink(missing_ok=True)
+            else:
+                if raw_dubbed.exists():
+                    shutil.move(str(raw_dubbed), str(candidate_audio))
+
+        if candidate_audio.exists() and candidate_audio.stat().st_size > 0:
+            dubbed_audio_path = candidate_audio
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate or locate valid dubbed audio track for export.",
+            )
+
+    # Prepare SRT file for FFmpeg libass subtitles filter
+    srt_content = build_srt_content(segments)
+    srt_file = OUTPUT_DIR / f"{job_id}-burnin.srt"
+    srt_file.write_text(srt_content, encoding="utf-8")
+
+    out_rendered_mp4 = OUTPUT_DIR / f"{job_id}_rendered.mp4"
+
+    current_stages = dict(job.get("stages", {}))
+    current_stages["exporting"] = "active"
+    update_job(
+        job_id,
+        {
+            "stage": "exporting",
+            "progress": 92,
+            "message": "កំពុងដំណើរការ Burn-in Subtitles & Audio ចូលក្នុងវីដេអូដោយ FFmpeg...",
+            "stages": current_stages,
+        },
+        persist_disk=True,
+    )
+
+    try:
+        render_res = await asyncio.to_thread(
+            render_video_with_subtitles,
+            input_media_path=media_path,
+            subtitles_srt_path=srt_file,
+            output_mp4_path=out_rendered_mp4,
+            font_size=payload.font_size,
+            audio_track_path=dubbed_audio_path,
+        )
+
+        current_stages["exporting"] = "completed"
+        current_stages["completed"] = "completed"
+        updated = update_job(
+            job_id,
+            {
+                "status": "transcribed",
+                "stage": "completed",
+                "progress": 100,
+                "message": "វីដេអូត្រូវបាន Render និងបញ្ចូល Subtitles & Dubbed Audio រួចរាល់ដោយជោគជ័យ!",
+                "rendered_video_path": str(out_rendered_mp4),
+                "has_rendered_video": True,
+                "has_dubbed_audio": dubbed_audio_path is not None,
+                "rendered_video_size_bytes": render_res.get("size_bytes"),
+                "rendered_video_duration": render_res.get("duration"),
+                "stages": current_stages,
+            },
+            persist_disk=True,
+        )
+        return safe_job(updated or job)
+    except Exception as exc:
+        logger.error("Video export failed for job %s: %s", job_id, exc)
+        current_stages["exporting"] = "failed"
+        update_job(
+            job_id,
+            {
+                "stage": "failed",
+                "message": f"Video export failed: {exc}",
+                "error": f"Video export failed: {exc}",
+                "stages": current_stages,
+            },
+            persist_disk=True,
+        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Video export failed: {exc}")
+
+
+@app.get("/api/jobs/{job_id}/rendered-video")
+async def get_rendered_video(job_id: str, download: bool = Query(default=False)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    rendered_path = (OUTPUT_DIR / f"{job_id}_rendered.mp4").resolve()
+    if not rendered_path.exists() or rendered_path.stat().st_size == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rendered video not found. Please click 'Export Final Video' first to render.",
+        )
+
+    filename = f"{Path(job.get('filename', 'video')).stem}_subtitled.mp4"
+    return FileResponse(
+        rendered_path,
+        media_type="video/mp4",
+        filename=filename,
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
+# =========================================================================
+# MULTILINGUAL AI VOICE DUBBING ENDPOINTS
+# =========================================================================
+
+@app.get("/api/dubbing/voices", response_model=list[VoiceInfo])
+async def list_available_voices(language: str | None = Query(default=None), target_language: str | None = Query(default=None)):
+    """
+    Lists available verified Neural TTS voices for the requested language.
+    Defaults to Khmer voices if no language is specified.
+    """
+    lang = language or target_language
+    voices = get_available_voices(lang)
+    return [VoiceInfo(**v) for v in voices]
+
+
+@app.post("/api/dubbing/sample")
+async def sample_voice_audio(
+    voice_id: str = Form(default="km-KH-PisethNeural"),
+    text: str | None = Form(default=None),
+):
+    """Generates an immediate audio preview sample for any selected neural voice."""
+    sample_dir = OUTPUT_DIR / "voice_samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    sample_file = sample_dir / f"sample_{voice_id}.mp3"
+
+    try:
+        sample_bytes = await generate_speech_sample(text=text, voice_id=voice_id)
+        sample_file.write_bytes(sample_bytes)
+        return FileResponse(sample_file, media_type="audio/mpeg", filename=f"{voice_id}_sample.mp3")
+    except Exception as exc:
+        logger.error("Failed to generate voice sample for %s: %s", voice_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate voice sample: {exc}",
+        )
+
+
+@app.post("/api/dubbing/segment-sample")
+async def sample_segment_audio(payload: SegmentAudioSampleRequest):
+    """Generates on-demand speech sample for an individual dialogue line with story emotion."""
+    try:
+        from .dubbing import generate_segment_audio
+        audio_bytes = await generate_segment_audio(
+            text=payload.text,
+            voice_id=payload.voice_id,
+            emotion=payload.emotion,
+            rate_pct=payload.rate,
+        )
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    except Exception as exc:
+        logger.error("Failed to generate segment audio sample: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate segment audio: {exc}",
+        )
+
+
+@app.post("/api/jobs/{job_id}/dub", response_model=JobResponse)
+async def generate_dubbing_for_job(job_id: str, payload: DubbingRequest = DubbingRequest()):
+    """
+    Synthesizes dialogue segments into timed speech matching speaker profiles and aligns with video.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    segments = job.get("translation") or job.get("transcript")
+    if not segments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No transcript or translation available to dub. Translate or transcribe the media first.",
+        )
+
+    # Build speaker voice lookup from job's speaker profiles if not in payload
+    speaker_voices = dict(payload.speaker_voices)
+    speaker_rates = dict(payload.speaker_rates)
+    for spk in job.get("speakers", []):
+        spk_id = spk.get("speaker_id")
+        if spk_id:
+            if spk_id not in speaker_voices and spk.get("assigned_voice_id"):
+                speaker_voices[spk_id] = spk["assigned_voice_id"]
+            if spk_id not in speaker_rates and spk.get("speech_rate"):
+                speaker_rates[spk_id] = spk["speech_rate"]
+
+    current_stages = dict(job.get("stages", {}))
+    current_stages["dubbing"] = "active"
+    update_job(
+        job_id,
+        {
+            "stage": "dubbing",
+            "progress": 60,
+            "message": f"កំពុងបង្កើតសំឡេងនិយាយ AI ({payload.voice_id})...",
+            "stages": current_stages,
+        },
+        persist_disk=True,
+    )
+
+    out_dubbed = OUTPUT_DIR / f"{job_id}_dubbed.mp3"
+    raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
+
+    try:
+        # Synthesize segments positioned accurately on the timeline
+        await generate_dubbed_audio_track(
+            segments=segments,
+            output_audio_path=raw_dubbed,
+            voice_id=payload.voice_id,
+            speaker_voices=speaker_voices,
+            speaker_rates=speaker_rates,
+            total_duration=float(job.get("duration_seconds", 10.0) or 10.0),
+            original_media_path=media_path,
+            preserve_nonverbal=payload.preserve_nonverbal,
+        )
+
+        media_path = _find_job_media_path(job_id, job)
+        if payload.mix_original and media_path and media_path.exists():
+            update_job(
+                job_id,
+                {
+                    "stage": "dubbing",
+                    "progress": 85,
+                    "message": "កំពុងលាយសំឡេង Dubbed ជាមួយសំឡេងដើមនៃវីដេអូ...",
+                },
+                persist_disk=True,
+            )
+            await asyncio.to_thread(
+                mix_audio_tracks,
+                original_audio_path=media_path,
+                dubbed_audio_path=raw_dubbed,
+                output_mixed_path=out_dubbed,
+                voice_volume=payload.voice_volume,
+                original_volume=payload.original_volume,
+                preserve_soundtrack=payload.preserve_soundtrack,
+                ducking_intensity=payload.ducking_intensity,
+            )
+            raw_dubbed.unlink(missing_ok=True)
+        else:
+            if raw_dubbed.exists():
+                shutil.move(str(raw_dubbed), str(out_dubbed))
+
+        if not out_dubbed.exists() or out_dubbed.stat().st_size < 500:
+            raise RuntimeError("Generated dubbed audio track is empty or corrupted.")
+
+        current_stages["dubbing"] = "completed"
+        updated = update_job(
+            job_id,
+            {
+                "status": "transcribed",
+                "stage": "completed",
+                "progress": 100,
+                "message": "ការបង្កើតសំឡេង Dubbed រួចរាល់ដោយជោគជ័យ!",
+                "has_dubbed_audio": True,
+                "dubbed_audio_url": f"/api/jobs/{job_id}/dubbed-audio",
+                "voice_settings": payload.model_dump(),
+                "stages": current_stages,
+            },
+            persist_disk=True,
+        )
+        return safe_job(updated or job)
+
+    except Exception as exc:
+        logger.error("Dubbing failed for job %s: %s", job_id, exc)
+        current_stages["dubbing"] = "failed"
+        update_job(
+            job_id,
+            {
+                "stage": "failed",
+                "message": f"Dubbing failed: {exc}",
+                "error": str(exc),
+                "stages": current_stages,
+            },
+            persist_disk=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Voice dubbing failed: {exc}",
+        )
+
+
+@app.get("/api/jobs/{job_id}/dubbed-audio")
+async def get_dubbed_audio(job_id: str, download: bool = Query(default=False)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    dubbed_file = (OUTPUT_DIR / f"{job_id}_dubbed.mp3").resolve()
+    if not dubbed_file.exists() or dubbed_file.stat().st_size == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dubbed audio not found. Please click 'Generate AI Dubbing' first.",
+        )
+
+    filename = f"{Path(job.get('filename', 'audio')).stem}_dubbed.mp3"
+    return FileResponse(
+        dubbed_file,
+        media_type="audio/mpeg",
+        filename=filename,
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
+# =========================================================================
+# SMART SETTINGS PERSISTENCE ENDPOINTS
+# =========================================================================
+
+SETTINGS_FILE = (BASE_DIR / "app_settings.json").resolve()
+
+
+@app.get("/api/settings", response_model=AppSettings)
+async def get_app_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            return AppSettings(**data)
+        except Exception as exc:
+            logger.warning("Failed to load settings file, using defaults: %s", exc)
+    return AppSettings()
+
+
+@app.put("/api/settings", response_model=AppSettings)
+async def update_app_settings(settings_payload: AppSettings):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(settings_payload.model_dump(), indent=2), encoding="utf-8")
+        return settings_payload
+    except Exception as exc:
+        logger.error("Failed to save settings: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not persist settings: {exc}",
+        )
+
+
+# =========================================================================
+# PRONUNCIATION & TERMINOLOGY DICTIONARY ENDPOINTS
+# =========================================================================
+
+@app.get("/api/dictionary", response_model=DictionaryListResponse)
+async def list_dictionary_entries():
+    """Returns all custom pronunciation and terminology dictionary entries."""
+    entries = dictionary_manager.get_all()
+    return DictionaryListResponse(entries=[DictionaryEntry(**e) for e in entries], total=len(entries))
+
+
+@app.post("/api/dictionary", response_model=DictionaryEntry)
+async def add_or_update_dictionary_entry(entry: DictionaryEntry):
+    """Adds or updates a terminology or pronunciation override."""
+    try:
+        updated = dictionary_manager.add_or_update(
+            term=entry.term,
+            replacement=entry.replacement,
+            category=entry.category,
+            notes=entry.notes,
+            case_sensitive=entry.case_sensitive,
+        )
+        return DictionaryEntry(**updated)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to update dictionary entry: {exc}",
+        )
+
+
+@app.delete("/api/dictionary/{term}")
+async def delete_dictionary_entry(term: str):
+    """Deletes an entry from the terminology dictionary."""
+    success = dictionary_manager.delete(term)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Term '{term}' not found in dictionary",
+        )
+    return {"status": "deleted", "term": term}
+
+
+# =========================================================================
+# KHMER PROOFREADING & GRAMMAR QUALITY PIPELINE ENDPOINTS
+# =========================================================================
+
+@app.post("/api/jobs/{job_id}/proofread", response_model=ProofreadJobResponse)
+async def proofread_job_translation(job_id: str, payload: ProofreadJobRequest):
+    """
+    Analyzes and suggests spelling, vowel/diacritic, grammar, and terminology
+    improvements for the job's translated subtitles.
+    Optionally applies high-confidence improvements automatically.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    translation = job.get("translation") or []
+    transcript = job.get("transcript") or []
+    if not translation:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job has no translation segments to proofread. Please translate first.",
+        )
+
+    proof_result = khmer_proofreader.proofread_segments(
+        segments=translation,
+        source_segments=transcript,
+        context_story=payload.context_story or job.get("name") or "",
+        style=payload.style,
+        auto_apply_high_confidence=payload.auto_apply_high_confidence,
+    )
+
+    if payload.auto_apply_high_confidence and proof_result["summary"]["auto_applied_count"] > 0:
+        updated_translation = []
+        for orig, res in zip(translation, proof_result["results"]):
+            item = dict(orig)
+            if res.get("applied_automatically"):
+                item["text"] = res["suggested_khmer"]
+            updated_translation.append(item)
+
+        # Update disk SRT/VTT/TXT files
+        srt_content = build_srt_content(updated_translation)
+        vtt_content = build_vtt_content(updated_translation)
+        txt_content = build_txt_content(updated_translation)
+        srt_p = OUTPUT_DIR / f"{job_id}_khmer.srt"
+        vtt_p = OUTPUT_DIR / f"{job_id}_khmer.vtt"
+        txt_p = OUTPUT_DIR / f"{job_id}_khmer.txt"
+        srt_p.write_text(srt_content, encoding="utf-8")
+        vtt_p.write_text(vtt_content, encoding="utf-8")
+        txt_p.write_text(txt_content, encoding="utf-8")
+
+        update_job(job_id, {"translation": updated_translation}, persist_disk=True)
+
+    return ProofreadJobResponse(
+        results=[SegmentProofreadResult(**r) for r in proof_result["results"]],
+        summary=proof_result["summary"],
+        total_issues=proof_result["total_issues"],
+    )
+
+
+@app.put("/api/jobs/{job_id}/proofread-apply", response_model=JobResponse)
+async def apply_proofread_changes(job_id: str, payload: ProofreadApplyRequest):
+    """
+    Applies reviewed and accepted proofread segments to the job translation,
+    regenerating SRT, VTT, and TXT subtitle files.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    new_segments = [s.model_dump() for s in payload.applied_segments]
+
+    srt_content = build_srt_content(new_segments)
+    vtt_content = build_vtt_content(new_segments)
+    txt_content = build_txt_content(new_segments)
+    srt_p = OUTPUT_DIR / f"{job_id}_khmer.srt"
+    vtt_p = OUTPUT_DIR / f"{job_id}_khmer.vtt"
+    txt_p = OUTPUT_DIR / f"{job_id}_khmer.txt"
+    srt_p.write_text(srt_content, encoding="utf-8")
+    vtt_p.write_text(vtt_content, encoding="utf-8")
+    txt_p.write_text(txt_content, encoding="utf-8")
+
+    updated = update_job(
+        job_id,
+        {"translation": new_segments, "has_dubbed_audio": False},
+        persist_disk=True,
+    )
+    return safe_job(updated or job)
+
+
+@app.post("/api/proofread-sample")
+async def proofread_sample_text(payload: ProofreadSampleRequest):
+    """Instant single-line proofreader for live editing and testing."""
+    res = khmer_proofreader.proofread_text(
+        text=payload.text,
+        source_text=payload.source_text,
+        style=payload.style,
+    )
+    return res
+
+
+# ==============================================================================
+# FRONTEND STATIC MOUNT (FOR ALL-IN-ONE PRODUCTION DEPLOYMENTS)
+# ==============================================================================
+FRONTEND_DIST = (BASE_DIR.parent / "frontend" / "dist").resolve()
+if FRONTEND_DIST.exists() and (FRONTEND_DIST / "index.html").exists():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+

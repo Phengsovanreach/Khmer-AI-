@@ -1,0 +1,128 @@
+[
+  {
+    "term": "AI",
+    "replacement": "បញ្ញាសិប្បនិម្មិត",
+    "category": "tech",
+    "notes": "Artificial Intelligence"
+  },
+  {
+    "term": "A.I.",
+    "replacement": "បញ្ញាសិប្បនិម្មិត",
+    "category": "tech",
+    "notes": "Abbreviation"
+  },
+  {
+    "term": "Video",
+    "replacement": "វីដេអូ",
+    "category": "media",
+    "notes": "Standard Khmer spelling"
+  },
+  {
+    "term": "Videos",
+    "replacement": "វីដេអូ",
+    "category": "media",
+    "notes": "Plural form"
+  },
+  {
+    "term": "Audio",
+    "replacement": "សំឡេង",
+    "category": "media",
+    "notes": "Audio / Voice"
+  },
+  {
+    "term": "Subtitle",
+    "replacement": "ចំណងជើងរង",
+    "category": "media",
+    "notes": "Subtitle / Hardsub"
+  },
+  {
+    "term": "Subtitles",
+    "replacement": "ចំណងជើងរង",
+    "category": "media",
+    "notes": "Subtitles plural"
+  },
+  {
+    "term": "Dubbing",
+    "replacement": "បញ្ចូលសំឡេង",
+    "category": "media",
+    "notes": "Voice dubbing"
+  },
+  {
+    "term": "Dubbed",
+    "replacement": "បញ្ចូលសំឡេងរួច",
+    "category": "media",
+    "notes": "Dubbed past participle"
+  },
+  {
+    "term": "YouTube",
+    "replacement": "យូធូប",
+    "category": "brand",
+    "notes": "Platform name"
+  },
+  {
+    "term": "Google",
+    "replacement": "ហ្គូហ្គល",
+    "category": "brand",
+    "notes": "Tech brand"
+  },
+  {
+    "term": "Facebook",
+    "replacement": "ហ្វេសប៊ុក",
+    "category": "brand",
+    "notes": "Social platform"
+  },
+  {
+    "term": "TikTok",
+    "replacement": "ទីកតុក",
+    "category": "brand",
+    "notes": "Social platform"
+  },
+  {
+    "term": "CEO",
+    "replacement": "អគ្គនាយក",
+    "category": "business",
+    "notes": "Chief Executive Officer"
+  },
+  {
+    "term": "Khmer",
+    "replacement": "ខ្មែរ",
+    "category": "culture",
+    "notes": "Language / Nation"
+  },
+  {
+    "term": "Cambodia",
+    "replacement": "កម្ពុជា",
+    "category": "geography",
+    "notes": "Country"
+  },
+  {
+    "term": "Angkor",
+    "replacement": "អង្គរ",
+    "category": "culture",
+    "notes": "Heritage site"
+  },
+  {
+    "term": "Phnom Penh",
+    "replacement": "ភ្នំពេញ",
+    "category": "geography",
+    "notes": "Capital city"
+  },
+  {
+    "term": "វីឌីអូ",
+    "replacement": "វីដេអូ",
+    "category": "spelling",
+    "notes": "Correct spelling of video"
+  },
+  {
+    "term": "អរគុណច្រើន",
+    "replacement": "សូមអរគុណច្រើន",
+    "category": "courtesy",
+    "notes": "Polite form"
+  },
+  {
+    "term": "បកប្រែពាក្យ",
+    "replacement": "បកប្រែ",
+    "category": "grammar",
+    "notes": "Concise natural phrasing"
+  }
+]
