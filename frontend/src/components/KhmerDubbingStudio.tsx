@@ -313,18 +313,26 @@ export const KhmerDubbingStudio: React.FC<KhmerDubbingStudioProps> = ({
 
           {/* Dubbed Audio Output Preview */}
           {job.has_dubbed_audio && job.dubbed_audio_url && (
-            <div className="mt-3 p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/40 flex items-center justify-between">
-              <div className="flex items-center gap-2 text-xs text-emerald-300">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                <span>សំឡេង Dubbed រួចរាល់សម្រាប់ចាក់ ឬទាញយក</span>
+            <div className="mt-3 p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/40 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs text-emerald-300">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>សំឡេង Dubbed រួចរាល់សម្រាប់ចាក់ ឬទាញយក</span>
+                </div>
+                <a
+                  href={job.dubbed_audio_url.startsWith('http') ? job.dubbed_audio_url : `${API}${job.dubbed_audio_url}`}
+                  download={`${job.id}_dubbed.mp3`}
+                  className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 flex items-center gap-1 shadow-sm"
+                >
+                  <Download className="w-3.5 h-3.5" /> MP3
+                </a>
               </div>
-              <a
-                href={job.dubbed_audio_url}
-                download
-                className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 flex items-center gap-1 shadow-sm"
-              >
-                <Download className="w-3.5 h-3.5" /> MP3
-              </a>
+              <audio
+                controls
+                className="w-full h-8 rounded"
+                src={job.dubbed_audio_url.startsWith('http') ? job.dubbed_audio_url : `${API}${job.dubbed_audio_url}`}
+                preload="metadata"
+              />
             </div>
           )}
         </div>

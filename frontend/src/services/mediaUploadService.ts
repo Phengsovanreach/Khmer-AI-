@@ -98,7 +98,7 @@ export class MediaUploadController {
   private uploadedChunks: Set<number> = new Set();
   private isPaused = false;
   private isCancelled = false;
-  private activeXhr: XMLHttpRequest | null = null;
+  private activeXhrs: Set<XMLHttpRequest> = new Set();
   private speedSamples: SpeedSample[] = [];
   private smoothedSpeed = 0;
   private lastProgressDispatch = 0;
@@ -332,46 +332,58 @@ export class MediaUploadController {
   private async uploadRemainingChunks(): Promise<void> {
     const total = this.totalChunks;
 
+    const remaining: number[] = [];
     for (let idx = 0; idx < total; idx++) {
-      if (this.isCancelled || this.isPaused) break;
-
-      // Skip already uploaded chunks (resumption support)
-      if (this.uploadedChunks.has(idx)) {
-        continue;
-      }
-
-      this.updateProgress({ currentChunk: idx + 1 });
-
-      const start = idx * this.chunkSize;
-      const end = Math.min(this.file.size, start + this.chunkSize);
-      const chunkBlob = this.file.slice(start, end);
-
-      let retriesLeft = this.options.maxRetries || 3;
-      let success = false;
-      let lastErr: any = null;
-
-      while (retriesLeft >= 0 && !success && !this.isPaused && !this.isCancelled) {
-        try {
-          await this.uploadSingleChunk(idx, chunkBlob);
-          this.uploadedChunks.add(idx);
-          success = true;
-        } catch (err: any) {
-          lastErr = err;
-          retriesLeft--;
-          if (retriesLeft >= 0 && !this.isPaused && !this.isCancelled) {
-            // Exponential backoff: 1000ms, 2000ms, 4000ms
-            const delay = Math.pow(2, 3 - retriesLeft) * 500;
-            await new Promise((res) => setTimeout(res, delay));
-          }
-        }
-      }
-
-      if (!success && !this.isPaused && !this.isCancelled) {
-        throw new Error(
-          `បរាជ័យក្នុងការ Upload Chunk ${idx + 1}/${total} ក្រោយការព្យាយាម ៣ ដង: ${lastErr?.message || 'Network error'}`
-        );
+      if (!this.uploadedChunks.has(idx)) {
+        remaining.push(idx);
       }
     }
+
+    if (remaining.length === 0) return;
+
+    let queueIndex = 0;
+    const concurrency = Math.min(2, remaining.length);
+
+    const worker = async (): Promise<void> => {
+      while (queueIndex < remaining.length && !this.isCancelled && !this.isPaused) {
+        const curIdx = queueIndex++;
+        const idx = remaining[curIdx];
+
+        this.updateProgress({ currentChunk: idx + 1 });
+
+        const start = idx * this.chunkSize;
+        const end = Math.min(this.file.size, start + this.chunkSize);
+        const chunkBlob = this.file.slice(start, end);
+
+        let retriesLeft = this.options.maxRetries || 3;
+        let success = false;
+        let lastErr: any = null;
+
+        while (retriesLeft >= 0 && !success && !this.isPaused && !this.isCancelled) {
+          try {
+            await this.uploadSingleChunk(idx, chunkBlob);
+            this.uploadedChunks.add(idx);
+            success = true;
+          } catch (err: any) {
+            lastErr = err;
+            retriesLeft--;
+            if (retriesLeft >= 0 && !this.isPaused && !this.isCancelled) {
+              const delay = Math.pow(2, 3 - retriesLeft) * 500;
+              await new Promise((res) => setTimeout(res, delay));
+            }
+          }
+        }
+
+        if (!success && !this.isPaused && !this.isCancelled) {
+          throw new Error(
+            `បរាជ័យក្នុងការ Upload Chunk ${idx + 1}/${total} ក្រោយការព្យាយាម ៣ ដង: ${lastErr?.message || 'Network error'}`
+          );
+        }
+      }
+    };
+
+    const workers = Array.from({ length: concurrency }, () => worker());
+    await Promise.all(workers);
   }
 
   private uploadSingleChunk(index: number, blob: Blob): Promise<void> {
@@ -380,7 +392,7 @@ export class MediaUploadController {
       if (this.isPaused) return reject(new Error('Paused'));
 
       const xhr = new XMLHttpRequest();
-      this.activeXhr = xhr;
+      this.activeXhrs.add(xhr);
 
       const fd = new FormData();
       fd.append('upload_id', this.uploadId!);
@@ -401,7 +413,7 @@ export class MediaUploadController {
       };
 
       xhr.onload = () => {
-        this.activeXhr = null;
+        this.activeXhrs.delete(xhr);
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
             const data = JSON.parse(xhr.responseText);
@@ -424,17 +436,17 @@ export class MediaUploadController {
       };
 
       xhr.onerror = () => {
-        this.activeXhr = null;
+        this.activeXhrs.delete(xhr);
         reject(new Error('ការតភ្ជាប់អ៊ីនធឺណិតដាច់ ឬមានបញ្ហាបណ្តាញ (Network connection lost)'));
       };
 
       xhr.ontimeout = () => {
-        this.activeXhr = null;
+        this.activeXhrs.delete(xhr);
         reject(new Error('Upload chunk timed out.'));
       };
 
       xhr.onabort = () => {
-        this.activeXhr = null;
+        this.activeXhrs.delete(xhr);
         reject(new Error(this.isPaused ? 'Paused' : 'Cancelled'));
       };
 
@@ -462,10 +474,12 @@ export class MediaUploadController {
   public pause() {
     if (this.currentProgress.phase !== 'uploading') return;
     this.isPaused = true;
-    if (this.activeXhr) {
-      this.activeXhr.abort();
-      this.activeXhr = null;
+    for (const xhr of this.activeXhrs) {
+      try {
+        xhr.abort();
+      } catch {}
     }
+    this.activeXhrs.clear();
     this.speedSamples = [];
     this.smoothedSpeed = 0;
     this.updateProgress({
@@ -558,10 +572,12 @@ export class MediaUploadController {
   public async cancel(): Promise<void> {
     this.isCancelled = true;
     this.isPaused = false;
-    if (this.activeXhr) {
-      this.activeXhr.abort();
-      this.activeXhr = null;
+    for (const xhr of this.activeXhrs) {
+      try {
+        xhr.abort();
+      } catch {}
     }
+    this.activeXhrs.clear();
 
     if (this.uploadId) {
       try {

@@ -247,6 +247,44 @@ def is_nonverbal_sound_segment(text: str) -> tuple[bool, str]:
     return False, ""
 
 
+def verify_audio_is_audible(file_path: Path, min_max_volume_db: float = -75.0) -> bool:
+    """
+    Validates with FFmpeg volumedetect that the audio file contains audible sound,
+    not merely digital silence (e.g. anullsrc, empty data, or muted track).
+    Returns True if audible, False if silent or corrupted.
+    """
+    if not file_path.exists() or file_path.stat().st_size < 100:
+        return False
+
+    cmd = [
+        "ffmpeg", "-v", "info",
+        "-i", str(file_path),
+        "-af", "volumedetect",
+        "-f", "null", "-",
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=15)
+        stderr_txt = res.stderr or ""
+
+        max_vol_match = re.search(r"max_volume:\s*(-?[\d\.]+)\s*dB", stderr_txt)
+        max_vol = float(max_vol_match.group(1)) if max_vol_match else -99.0
+
+        return max_vol > min_max_volume_db
+    except Exception as exc:
+        logger.warning("Could not execute volumedetect on %s: %s", file_path.name, exc)
+        dur = get_audio_file_duration(file_path)
+        return bool(dur > 0.1 and file_path.stat().st_size > 500)
+
+
+def get_default_voice_for_language(lang_code: str | None) -> str:
+    """Returns the best recommended Neural TTS voice for any target language."""
+    voices = get_available_voices(lang_code)
+    for v in voices:
+        if v.get("recommended"):
+            return v["id"]
+    return voices[0]["id"] if voices else "km-KH-PisethNeural"
+
+
 def get_audio_file_duration(file_path: Path) -> float:
     """Returns exact audio stream duration in seconds via ffprobe."""
     if not file_path.exists() or file_path.stat().st_size == 0:
@@ -362,6 +400,7 @@ async def generate_dubbed_audio_track(
     output_audio_path: Path | None = None,
     original_media_path: Path | None = None,
     preserve_nonverbal: bool = True,
+    target_language: str | None = None,
     **kwargs: Any,
 ) -> Path:
     """
@@ -373,6 +412,11 @@ async def generate_dubbed_audio_track(
         raise ValueError("output_audio_path is required")
 
     output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolve target language voice if language specified or mismatched
+    target_lang = target_language or kwargs.get("target_lang")
+    if target_lang and (not voice_id or (target_lang.lower().startswith("en") and "km-" in voice_id.lower())):
+        voice_id = get_default_voice_for_language(target_lang)
 
     spk_voices = speaker_voices or {}
     spk_rates = speaker_rates or {}
@@ -394,8 +438,9 @@ async def generate_dubbed_audio_track(
     filter_parts: list[str] = ["[0:a]aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo[base]"]
 
     try:
-        filter_idx = 1
-        for idx, seg in enumerate(non_empty_segs):
+        tts_sem = asyncio.Semaphore(5)
+
+        async def _render_segment(idx: int, seg: dict[str, Any]) -> tuple[int, Path | None, int]:
             text = str(seg.get("text", "")).strip()
             start_s = float(seg.get("start", 0.0))
             end_s = float(seg.get("end", 0.0))
@@ -410,7 +455,7 @@ async def generate_dubbed_audio_track(
             if is_nv:
                 extracted = False
                 if preserve_nonverbal and orig_media and orig_media.exists():
-                    extracted = extract_original_audio_slice(orig_media, start_s, end_s, seg_file)
+                    extracted = await asyncio.to_thread(extract_original_audio_slice, orig_media, start_s, end_s, seg_file)
                     if extracted:
                         logger.info("Preserved authentic original %s sound on seg %d (%.2f-%.2f)", nv_type, idx, start_s, end_s)
 
@@ -429,7 +474,7 @@ async def generate_dubbed_audio_track(
                     spk_id = seg.get("speaker_id")
                     seg_voice = spk_voices.get(spk_id) if spk_id else None
                     if not seg_voice:
-                        seg_voice = voice_id or "km-KH-PisethNeural"
+                        seg_voice = voice_id or (get_default_voice_for_language(target_lang) if target_lang else "km-KH-PisethNeural")
 
                     rate_pct = spk_rates.get(spk_id, 0) if spk_id else 0
                     rate_str = f"+{rate_pct}%" if rate_pct >= 0 else f"{rate_pct}%"
@@ -444,38 +489,65 @@ async def generate_dubbed_audio_track(
                         from .khmer_nlp import normalize_khmer_for_tts
                         clean_text = normalize_khmer_for_tts(text) or text
 
-                    try:
-                        comm = edge_tts.Communicate(clean_text, seg_voice, rate=em_rate, pitch=em_pitch, volume=em_vol)
-                        await comm.save(str(seg_file))
-                    except Exception as exc:
-                        logger.warning("TTS error with emotion modulation on seg %d: %s, falling back to base rate", idx, exc)
+                    speech_generated = False
+                    async with tts_sem:
                         try:
-                            comm = edge_tts.Communicate(clean_text, seg_voice, rate=rate_str)
+                            comm = edge_tts.Communicate(clean_text, seg_voice, rate=em_rate, pitch=em_pitch, volume=em_vol)
                             await comm.save(str(seg_file))
-                        except Exception as exc2:
-                            logger.warning("TTS error on segment %d voice %s: %s, falling back to default voice", idx, seg_voice, exc2)
+                            if seg_file.exists() and seg_file.stat().st_size > 200:
+                                speech_generated = True
+                        except Exception as exc:
+                            logger.warning("TTS error with emotion modulation on seg %d: %s, falling back to base rate", idx, exc)
                             try:
-                                comm = edge_tts.Communicate(clean_text, voice_id)
+                                comm = edge_tts.Communicate(clean_text, seg_voice, rate=rate_str)
                                 await comm.save(str(seg_file))
-                            except Exception as exc3:
-                                logger.warning("TTS failed on segment %d ('%s'): %s. Using silence fallback.", idx, clean_text[:30], exc3)
-                                cmd_silence = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=stereo:d={seg_duration}", "-c:a", "libmp3lame", str(seg_file)]
-                                await asyncio.to_thread(subprocess.run, cmd_silence, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                                if seg_file.exists() and seg_file.stat().st_size > 200:
+                                    speech_generated = True
+                            except Exception as exc2:
+                                logger.warning("TTS error on segment %d voice %s: %s, falling back to default voice", idx, seg_voice, exc2)
+                                try:
+                                    fallback_voice = get_default_voice_for_language(target_lang) if target_lang else voice_id
+                                    comm = edge_tts.Communicate(clean_text, fallback_voice)
+                                    await comm.save(str(seg_file))
+                                    if seg_file.exists() and seg_file.stat().st_size > 200:
+                                        speech_generated = True
+                                except Exception as exc3:
+                                    logger.error("TTS failed on segment %d ('%s'): %s.", idx, clean_text[:30], exc3)
 
-                    # Fit speech to dialogue window so sentence endings & last words are never clipped
-                    if seg_file.exists() and seg_file.stat().st_size > 0:
+                    if not speech_generated:
+                        # If TTS service failed, do NOT falsely report silence as valid voice
+                        logger.warning("Segment %d has no valid speech audio generated from TTS.", idx)
+                        seg_file = None
+                    else:
+                        # Fit speech to dialogue window so sentence endings & last words are never clipped
                         fitted_file = Path(tempfile.mktemp(suffix=f"_fitted_{idx}.mp3"))
                         temp_files.append(fitted_file)
-                        fitted_path, _ = fit_speech_audio_to_window(seg_file, seg_duration, fitted_file)
+                        fitted_path, _ = await asyncio.to_thread(fit_speech_audio_to_window, seg_file, seg_duration, fitted_file)
                         seg_file = fitted_path
 
-            if seg_file.exists() and seg_file.stat().st_size > 0:
+            if seg_file and seg_file.exists() and seg_file.stat().st_size > 0:
+                return idx, seg_file, start_ms
+            return idx, None, start_ms
+
+        rendered_segs = await asyncio.gather(*[_render_segment(i, s) for i, s in enumerate(non_empty_segs)])
+        rendered_segs.sort(key=lambda x: x[0])
+
+        filter_idx = 1
+        for idx, seg_file, start_ms in rendered_segs:
+            if seg_file and seg_file.exists() and seg_file.stat().st_size > 0:
                 inputs.extend(["-i", str(seg_file)])
                 filter_parts.append(f"[{filter_idx}:a]adelay={start_ms}|{start_ms},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo[a{filter_idx}]")
                 filter_idx += 1
 
         if filter_idx == 1:
-            # Only the base track exists (no speech segments succeeded)
+            # If all speech segments had text but none produced audio
+            has_spoken_text = any(any(c.isalnum() or ('\u1780' <= c <= '\u17ff') for c in str(s.get("text", ""))) for s in non_empty_segs)
+            if has_spoken_text:
+                raise RuntimeError(
+                    "TTS speech generation failed to produce any audible audio tracks for translated segments. "
+                    "Please check network connectivity to the voice service and verify target language voice selection."
+                )
+            # Only if all segments were nonverbal silence cues:
             cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=stereo:d={max(total_duration, 1.0)}", "-c:a", "libmp3lame", str(output_audio_path)]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             return output_audio_path
@@ -490,6 +562,7 @@ async def generate_dubbed_audio_track(
             "-map", "[out]",
             "-c:a", "libmp3lame",
             "-b:a", "192k",
+            "-threads", "0",
             str(output_audio_path),
         ]
 
@@ -501,6 +574,8 @@ async def generate_dubbed_audio_track(
 
         if not output_audio_path.exists() or output_audio_path.stat().st_size < 100:
             raise RuntimeError("Generated dubbed audio file is missing or invalid.")
+        if not verify_audio_is_audible(output_audio_path):
+            raise RuntimeError("Generated dubbed audio track contains no audible speech.")
 
         return output_audio_path
     finally:
@@ -549,11 +624,14 @@ def intelligent_mix_soundtrack(
     voice_vol = max(0.0, min(float(v_vol), 3.0))
     orig_vol = max(0.0, min(float(st_vol), 2.0))
 
-    # Probe original media to check if it has an audio stream
+    # Probe media files to check streams and determine precise target duration
     from .transcription import probe_media_file
-    probe = probe_media_file(orig_p)
-    streams = probe.get("streams", [])
-    has_orig_audio = any(s.get("codec_type") == "audio" for s in streams)
+    probe_orig = probe_media_file(orig_p, require_audio=False)
+    probe_dub = probe_media_file(dub_p, require_audio=False)
+    has_orig_audio = probe_orig.get("has_audio", False)
+    orig_dur = float(probe_orig.get("duration", 0.0) or 0.0)
+    dub_dur = float(probe_dub.get("duration", 0.0) or 0.0)
+    target_dur = max(orig_dur, dub_dur)
 
     if not has_orig_audio or not preserve_soundtrack or orig_vol <= 0.01:
         # No original audio, or user turned off soundtrack preservation -> encode dubbed speech directly
@@ -576,13 +654,15 @@ def intelligent_mix_soundtrack(
     # sidechaincompress smoothly attenuates background only while voice signal is present.
     # equalizer gently dips 1.4 kHz voice formants on the ducked track to eliminate vocal clashes.
     filter_complex = (
-        f"[0:a]volume={orig_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo[bg_raw];"
-        f"[1:a]volume={voice_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo,apad[voice];"
-        f"[voice]asplit=2[voice_mix][voice_sc];"
-        f"[bg_raw][voice_sc]sidechaincompress=threshold=0.03:ratio=5:attack=35:release=300[ducked_raw];"
-        f"[ducked_raw]equalizer=f=1400:t=q:w=1.0:g=-5[ducked_bg];"
-        f"[ducked_bg][voice_mix]amix=inputs=2:duration=first:dropout_transition=2[out]"
+        f"[0:a]volume={orig_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo,apad[bg_raw];"
+        f"[1:a]volume={voice_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo,apad[voice_pad];"
+        f"[voice_pad]asplit=2[voice_mix][voice_sc];"
+        f"[bg_raw][voice_sc]sidechaincompress=threshold=0.04:ratio=4:attack=35:release=300[ducked_raw];"
+        f"[ducked_raw]equalizer=f=1400:t=q:w=1.0:g=-4[ducked_bg];"
+        f"[ducked_bg][voice_mix]amix=inputs=2:duration=longest:dropout_transition=2[out]"
     )
+
+    t_args = ["-t", f"{target_dur:.3f}"] if target_dur > 0.05 else []
 
     cmd = [
         "ffmpeg", "-y",
@@ -590,15 +670,38 @@ def intelligent_mix_soundtrack(
         "-i", str(dub_p),
         "-filter_complex", filter_complex,
         "-map", "[out]",
+        *t_args,
         "-c:a", "libmp3lame",
         "-b:a", "192k",
+        "-threads", "0",
         str(out_p),
     ]
 
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
     if res.returncode != 0:
-        err = res.stderr[-500:] if res.stderr else "Audio mix failed"
-        raise RuntimeError(f"FFmpeg speech-aware audio mixing failed: {err}")
+        logger.warning("Sidechain compression mixing failed (%s), falling back to robust simple amix", res.stderr[-200:] if res.stderr else "")
+        # Robust fallback: standard amix without sidechain
+        fb_filter = (
+            f"[0:a]volume={orig_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo,apad[a0];"
+            f"[1:a]volume={voice_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo,apad[a1];"
+            f"[a0][a1]amix=inputs=2:duration=longest:dropout_transition=2[out]"
+        )
+        cmd_fb = [
+            "ffmpeg", "-y",
+            "-i", str(orig_p),
+            "-i", str(dub_p),
+            "-filter_complex", fb_filter,
+            "-map", "[out]",
+            *t_args,
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            str(out_p),
+        ]
+        res_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        if res_fb.returncode != 0:
+            logger.error("Standard amix also failed, copying dubbed audio track directly")
+            cmd_copy = ["ffmpeg", "-y", "-i", str(dub_p), "-c:a", "libmp3lame", "-b:a", "192k", str(out_p)]
+            subprocess.run(cmd_copy, check=True)
 
     if not out_p.exists() or out_p.stat().st_size == 0:
         raise RuntimeError("Mixed audio file is empty or missing.")

@@ -33,12 +33,12 @@ EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
 AUTH_DB_FILE = AUTH_DB_PATH
 
-# OWASP Recommended standard for Argon2id:
-# Memory: 64 MiB (65536 KiB), Iterations/Time cost: 3, Parallelism: 4, Hash length: 32 bytes
+# OWASP & RFC 9106 Recommended Cloud Standard for Argon2id:
+# Memory: 32 MiB (32768 KiB), Iterations/Time cost: 2, Parallelism: 2, Hash length: 32 bytes
 argon2_hasher = argon2.PasswordHasher(
-    time_cost=3,
-    memory_cost=65536,
-    parallelism=4,
+    time_cost=2,
+    memory_cost=32768,
+    parallelism=2,
     hash_len=32,
     type=argon2.Type.ID,
 )

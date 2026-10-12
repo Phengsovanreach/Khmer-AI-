@@ -71,10 +71,14 @@ def _translate_via_mymemory(text: str, source_lang: str, target_lang: str) -> st
     return None
 
 
+_TRANSLATION_CACHE: dict[tuple[str, str, str], str] = {}
+_CACHE_MAX_ENTRIES = 4096
+
+
 def translate_single_line(text: str, source_lang: str = "auto", target_lang: str = "km") -> str:
     """
     Translates a single line of text from source_lang to target_lang.
-    Uses resilient dual-engine fallbacks (Google GTX + MyMemory).
+    Uses resilient dual-engine fallbacks (Google GTX + MyMemory) and in-memory LRU cache.
     Does NOT require Ollama or paid APIs.
     """
     clean = text.strip()
@@ -88,14 +92,24 @@ def translate_single_line(text: str, source_lang: str = "auto", target_lang: str
     if src == tgt and src != "auto":
         return clean
 
+    cache_key = (clean, src, tgt)
+    if cache_key in _TRANSLATION_CACHE:
+        return _TRANSLATION_CACHE[cache_key]
+
     # Try GTX first
     result = _translate_via_gtx(clean, src, tgt)
     if result:
+        if len(_TRANSLATION_CACHE) >= _CACHE_MAX_ENTRIES:
+            _TRANSLATION_CACHE.pop(next(iter(_TRANSLATION_CACHE)), None)
+        _TRANSLATION_CACHE[cache_key] = result
         return result
 
     # Try MyMemory fallback
     result = _translate_via_mymemory(clean, src, tgt)
     if result:
+        if len(_TRANSLATION_CACHE) >= _CACHE_MAX_ENTRIES:
+            _TRANSLATION_CACHE.pop(next(iter(_TRANSLATION_CACHE)), None)
+        _TRANSLATION_CACHE[cache_key] = result
         return result
 
     # Return original if all providers unavailable
@@ -119,7 +133,7 @@ async def translate_segments(
     """
     Translates transcript subtitle segments from source_lang to target_lang.
     Preserves exact timing, start, end, IDs, speaker assignments, and order.
-    Does NOT require Ollama or heavy local LLMs.
+    Executes in high-throughput bounded parallel workers for maximum speed.
     """
     if not segments:
         return []
@@ -127,12 +141,12 @@ async def translate_segments(
     src = _normalize_lang_code(source_lang, is_target=False)
     tgt = _normalize_lang_code(target_lang, is_target=True)
 
-    translated_segments: list[dict[str, Any]] = []
+    sem = asyncio.Semaphore(6)
 
-    for seg in sorted(segments, key=lambda s: s.get("start", 0.0)):
+    async def _translate_single_seg(seg: dict[str, Any], fallback_id: int) -> dict[str, Any]:
         orig_text = str(seg.get("text", "")).strip()
         speaker_id = seg.get("speaker_id")
-        seg_id = seg.get("id", len(translated_segments) + 1)
+        seg_id = seg.get("id", fallback_id)
         start_t = round(float(seg.get("start", 0.0)), 3)
         end_t = round(float(seg.get("end", 0.0)), 3)
 
@@ -145,10 +159,10 @@ async def translate_segments(
             }
             if speaker_id:
                 out_seg["speaker_id"] = speaker_id
-            translated_segments.append(out_seg)
-            continue
+            return out_seg
 
-        translated_text = await asyncio.to_thread(translate_single_line, orig_text, src, tgt)
+        async with sem:
+            translated_text = await asyncio.to_thread(translate_single_line, orig_text, src, tgt)
 
         out_seg = {
             "id": seg_id,
@@ -158,11 +172,12 @@ async def translate_segments(
         }
         if speaker_id:
             out_seg["speaker_id"] = speaker_id
-        translated_segments.append(out_seg)
+        return out_seg
 
-        await asyncio.sleep(0.04)
-
-    return translated_segments
+    sorted_segs = sorted(segments, key=lambda s: s.get("start", 0.0))
+    tasks = [_translate_single_seg(s, idx + 1) for idx, s in enumerate(sorted_segs)]
+    translated_segments = await asyncio.gather(*tasks)
+    return list(translated_segments)
 
 
 async def translate_segments_to_khmer(

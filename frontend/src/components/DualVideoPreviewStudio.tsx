@@ -184,31 +184,59 @@ export const DualVideoPreviewStudio: React.FC<DualVideoPreviewStudioProps> = ({
     const time = e.currentTarget.currentTime;
     if (layoutMode === 'translated_only') {
       setCurrentTime(time);
+      if (dubbedAudioRef.current && Math.abs(dubbedAudioRef.current.currentTime - time) > 0.25) {
+        dubbedAudioRef.current.currentTime = time;
+      }
       if (origVideoRef.current && Math.abs(origVideoRef.current.currentTime - time) > 0.25) {
         origVideoRef.current.currentTime = time;
       }
     }
   };
 
-  // Update audio volumes based on audio mode
+  // Update audio volumes based on audio mode and active layout
   useEffect(() => {
     if (origVideoRef.current) {
+      origVideoRef.current.muted = isOrigMuted || audioMode === 'dubbed';
       origVideoRef.current.volume = isOrigMuted || audioMode === 'dubbed' ? 0 : origVolume;
     }
     if (transVideoRef.current) {
       // If translated video is rendered MP4, it has dubbed audio embedded
       if (hasRendered) {
+        transVideoRef.current.muted = isTransMuted || audioMode === 'original';
         transVideoRef.current.volume = isTransMuted || audioMode === 'original' ? 0 : transVolume;
+      } else if (layoutMode === 'translated_only') {
+        // In translated_only mode, Panel 1 (original video) is unmounted!
+        if (hasDubbedAudio) {
+          // Dubbed voice is output via dubbedAudioRef; keep transVideo as background audio if soundtrack preserved
+          transVideoRef.current.muted = !preserveSoundtrack || isTransMuted || audioMode === 'dubbed';
+          transVideoRef.current.volume = isTransMuted || audioMode === 'dubbed' ? 0 : soundtrackVolume;
+        } else {
+          // No separate dubbed audio: transVideo MUST be unmuted so user hears audio with translated subtitles
+          transVideoRef.current.muted = isTransMuted;
+          transVideoRef.current.volume = isTransMuted ? 0 : transVolume;
+        }
       } else {
-        // In live overlay mode, translated video panel video element stays muted
-        // to avoid duplicate audio with the original player
+        // In side-by-side or split mode, origVideo is active and plays soundtrack to avoid echoing
         transVideoRef.current.muted = true;
       }
     }
     if (dubbedAudioRef.current) {
-      dubbedAudioRef.current.volume = isTransMuted || audioMode === 'original' ? 0 : transVolume;
+      dubbedAudioRef.current.muted = isTransMuted || audioMode === 'original';
+      dubbedAudioRef.current.volume = isTransMuted || audioMode === 'original' ? 0 : dialogueVolume;
     }
-  }, [audioMode, origVolume, transVolume, isOrigMuted, isTransMuted, hasRendered]);
+  }, [
+    audioMode,
+    origVolume,
+    transVolume,
+    soundtrackVolume,
+    dialogueVolume,
+    preserveSoundtrack,
+    isOrigMuted,
+    isTransMuted,
+    hasRendered,
+    hasDubbedAudio,
+    layoutMode,
+  ]);
 
   // Update playback rate
   const handleSpeedChange = (rate: number) => {

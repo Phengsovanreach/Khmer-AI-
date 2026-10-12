@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -30,7 +31,9 @@ from .dubbing import (
     generate_speech_sample,
     get_available_khmer_voices,
     get_available_voices,
+    get_default_voice_for_language,
     mix_audio_tracks,
+    verify_audio_is_audible,
 )
 from .languages import (
     SUPPORTED_LANGUAGES,
@@ -573,6 +576,7 @@ async def _save_upload_and_validate(video: UploadFile) -> tuple[str, str, Path, 
 
 CHUNK_UPLOAD_DIR = (UPLOAD_DIR / ".chunks").resolve()
 CHUNK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_CHUNK_METADATA_LOCK = threading.Lock()
 
 
 def _clean_expired_upload_sessions(max_age_seconds: int = 86400) -> None:
@@ -695,22 +699,23 @@ async def upload_media_chunk(
 
     part_file.write_bytes(chunk_bytes)
 
-    # Recalculate uploaded chunks and bytes based on physical part files
-    part_files = sorted(session_dir.glob("chunk_*.part"))
-    uploaded_indices = []
-    total_written = 0
-    for pf in part_files:
-        try:
-            idx = int(pf.stem.split("_")[1])
-            uploaded_indices.append(idx)
-            total_written += pf.stat().st_size
-        except (ValueError, IndexError):
-            continue
+    with _CHUNK_METADATA_LOCK:
+        # Recalculate uploaded chunks and bytes based on physical part files
+        part_files = sorted(session_dir.glob("chunk_*.part"))
+        uploaded_indices = []
+        total_written = 0
+        for pf in part_files:
+            try:
+                idx = int(pf.stem.split("_")[1])
+                uploaded_indices.append(idx)
+                total_written += pf.stat().st_size
+            except (ValueError, IndexError):
+                continue
 
-    metadata["uploaded_chunks"] = sorted(set(uploaded_indices))
-    metadata["uploaded_bytes"] = total_written
-    metadata["updated_at"] = utcnow()
-    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        metadata["uploaded_chunks"] = sorted(set(uploaded_indices))
+        metadata["uploaded_bytes"] = total_written
+        metadata["updated_at"] = utcnow()
+        meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     return UploadChunkResponse(
         upload_id=upload_id,
@@ -1368,11 +1373,17 @@ async def _execute_transcription(
                     raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
                     spk_voices = {p["speaker_id"]: p["assigned_voice_id"] for p in speaker_profiles if p.get("speaker_id") and p.get("assigned_voice_id")}
                     spk_rates = {p["speaker_id"]: p.get("speech_rate", 0) for p in speaker_profiles if p.get("speaker_id")}
+                    default_voice = get_default_voice_for_language(target_lang or "km")
+                    primary_voice = (
+                        speaker_profiles[0]["assigned_voice_id"]
+                        if (speaker_profiles and speaker_profiles[0].get("assigned_voice_id"))
+                        else default_voice
+                    )
 
                     await generate_dubbed_audio_track(
                         segments=dub_segments,
                         output_audio_path=raw_dubbed,
-                        voice_id=speaker_profiles[0]["assigned_voice_id"] if speaker_profiles else "km-KH-PisethNeural",
+                        voice_id=primary_voice,
                         speaker_voices=spk_voices,
                         speaker_rates=spk_rates,
                         total_duration=float(total_duration or 10.0),
@@ -1396,7 +1407,7 @@ async def _execute_transcription(
                         if raw_dubbed.exists():
                             shutil.move(str(raw_dubbed), str(out_dubbed))
 
-                    if out_dubbed.exists() and out_dubbed.stat().st_size > 100:
+                    if out_dubbed.exists() and verify_audio_is_audible(out_dubbed):
                         has_dubbed_audio = True
                         dubbed_audio_url = f"/api/jobs/{job_id}/dubbed-audio"
                 except Exception as d_err:
@@ -2031,6 +2042,56 @@ async def translate_job_endpoint(
             target_lang=tgt_lang,
         )
 
+        # Auto-synthesize dubbed audio track so preview and export immediately have sound
+        has_dubbed_audio = False
+        dubbed_audio_url = None
+        try:
+            target_voice = get_default_voice_for_language(tgt_lang)
+            out_dubbed = OUTPUT_DIR / f"{job_id}_dubbed.mp3"
+            raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
+            media_path = _find_job_media_path(job_id, job)
+            speaker_voices = {}
+            speaker_rates = {}
+            for spk in job.get("speakers", []):
+                spk_id = spk.get("speaker_id")
+                if spk_id and spk.get("assigned_voice_id"):
+                    speaker_voices[spk_id] = spk["assigned_voice_id"]
+                if spk_id and spk.get("speech_rate"):
+                    speaker_rates[spk_id] = spk["speech_rate"]
+
+            await generate_dubbed_audio_track(
+                segments=translated_segments,
+                output_audio_path=raw_dubbed,
+                voice_id=target_voice,
+                speaker_voices=speaker_voices,
+                speaker_rates=speaker_rates,
+                total_duration=float(job.get("duration_seconds", 10.0) or 10.0),
+                original_media_path=media_path,
+                preserve_nonverbal=True,
+            )
+
+            if media_path and media_path.exists():
+                await asyncio.to_thread(
+                    mix_audio_tracks,
+                    original_audio_path=media_path,
+                    dubbed_audio_path=raw_dubbed,
+                    output_mixed_path=out_dubbed,
+                    voice_volume=1.0,
+                    original_volume=0.85,
+                    preserve_soundtrack=True,
+                    ducking_intensity=0.35,
+                )
+                raw_dubbed.unlink(missing_ok=True)
+            else:
+                if raw_dubbed.exists():
+                    shutil.move(str(raw_dubbed), str(out_dubbed))
+
+            if out_dubbed.exists() and verify_audio_is_audible(out_dubbed):
+                has_dubbed_audio = True
+                dubbed_audio_url = f"/api/jobs/{job_id}/dubbed-audio"
+        except Exception as dub_err:
+            logger.warning("Auto-synthesis of dubbed audio during translation failed or skipped: %s", dub_err)
+
         current_stages["translating"] = "completed"
         current_stages["generating_subtitles"] = "completed"
         updated = update_job(job_id, {
@@ -2040,6 +2101,8 @@ async def translate_job_endpoint(
             "message": f"ការបកប្រែជាភាសា {tgt_lang} បានជោគជ័យពេញលេញ!",
             "translation": translated_segments,
             "target_language": tgt_lang,
+            "has_dubbed_audio": has_dubbed_audio,
+            "dubbed_audio_url": dubbed_audio_url,
             "stages": current_stages,
             "updated_at": utcnow(),
         })
@@ -2391,9 +2454,10 @@ async def export_rendered_video(job_id: str, payload: VideoExportRequest = Video
     should_include_dub = payload.include_dubbed_audio and payload.audio_mode != "original"
     if should_include_dub:
         candidate_audio = (OUTPUT_DIR / f"{job_id}_dubbed.mp3").resolve()
-        # If candidate audio does not exist or is invalid, auto-synthesize on-demand!
-        if not (candidate_audio.exists() and candidate_audio.stat().st_size > 500):
-            logger.info("Dubbed audio track missing or invalid for job %s. Auto-generating before export...", job_id)
+        # If candidate audio does not exist, is empty, or is silent, auto-synthesize on-demand!
+        is_candidate_valid = candidate_audio.exists() and candidate_audio.stat().st_size > 500 and verify_audio_is_audible(candidate_audio)
+        if not is_candidate_valid:
+            logger.info("Dubbed audio track missing or inaudible for job %s. Auto-generating before export...", job_id)
             speaker_voices = {}
             speaker_rates = {}
             for spk in job.get("speakers", []):
@@ -2404,40 +2468,51 @@ async def export_rendered_video(job_id: str, payload: VideoExportRequest = Video
                     if spk.get("speech_rate"):
                         speaker_rates[spk_id] = spk["speech_rate"]
 
+            target_lang = job.get("target_language") or "km"
+            default_voice = get_default_voice_for_language(target_lang)
+            chosen_voice = job.get("voice_settings", {}).get("voice_id") or default_voice
+
             raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
-            await generate_dubbed_audio_track(
-                segments=segments,
-                output_audio_path=raw_dubbed,
-                voice_id=job.get("voice_settings", {}).get("voice_id") or "km-KH-PisethNeural",
-                speaker_voices=speaker_voices,
-                speaker_rates=speaker_rates,
-                total_duration=float(job.get("duration_seconds", 10.0) or 10.0),
-                original_media_path=media_path,
-                preserve_nonverbal=getattr(payload, "preserve_nonverbal", True),
-            )
-
-            if payload.audio_mode == "mixed" and media_path and media_path.exists():
-                await asyncio.to_thread(
-                    mix_audio_tracks,
-                    original_audio_path=media_path,
-                    dubbed_audio_path=raw_dubbed,
-                    output_mixed_path=candidate_audio,
-                    voice_volume=payload.voice_volume,
-                    original_volume=payload.original_volume,
-                    preserve_soundtrack=payload.preserve_soundtrack,
-                    ducking_intensity=payload.ducking_intensity,
+            try:
+                await generate_dubbed_audio_track(
+                    segments=segments,
+                    output_audio_path=raw_dubbed,
+                    voice_id=chosen_voice,
+                    speaker_voices=speaker_voices,
+                    speaker_rates=speaker_rates,
+                    total_duration=float(job.get("duration_seconds", 10.0) or 10.0),
+                    original_media_path=media_path,
+                    preserve_nonverbal=getattr(payload, "preserve_nonverbal", True),
                 )
-                raw_dubbed.unlink(missing_ok=True)
-            else:
-                if raw_dubbed.exists():
-                    shutil.move(str(raw_dubbed), str(candidate_audio))
 
-        if candidate_audio.exists() and candidate_audio.stat().st_size > 0:
+                if payload.audio_mode == "mixed" and media_path and media_path.exists():
+                    await asyncio.to_thread(
+                        mix_audio_tracks,
+                        original_audio_path=media_path,
+                        dubbed_audio_path=raw_dubbed,
+                        output_mixed_path=candidate_audio,
+                        voice_volume=payload.voice_volume,
+                        original_volume=payload.original_volume,
+                        preserve_soundtrack=payload.preserve_soundtrack,
+                        ducking_intensity=payload.ducking_intensity,
+                    )
+                    raw_dubbed.unlink(missing_ok=True)
+                else:
+                    if raw_dubbed.exists():
+                        shutil.move(str(raw_dubbed), str(candidate_audio))
+            except Exception as gen_err:
+                logger.error("Dubbed audio generation failed during export: %s", gen_err)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Dubbed audio generation failed: {gen_err}",
+                )
+
+        if candidate_audio.exists() and candidate_audio.stat().st_size > 0 and verify_audio_is_audible(candidate_audio):
             dubbed_audio_path = candidate_audio
         else:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to generate or locate valid dubbed audio track for export.",
+                detail="Failed to generate or locate valid audible dubbed audio track for export.",
             )
 
     # Prepare SRT file for FFmpeg libass subtitles filter
@@ -2689,6 +2764,8 @@ async def generate_dubbing_for_job(job_id: str, payload: DubbingRequest = Dubbin
 
         if not out_dubbed.exists() or out_dubbed.stat().st_size < 500:
             raise RuntimeError("Generated dubbed audio track is empty or corrupted.")
+        if not verify_audio_is_audible(out_dubbed):
+            raise RuntimeError("Generated dubbed audio track is completely silent or inaudible.")
 
         current_stages["dubbing"] = "completed"
         updated = update_job(

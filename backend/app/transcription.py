@@ -2,6 +2,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -70,8 +71,9 @@ def get_whisper_model(model_id: str = "tiny", device: str = "cpu", compute_type:
             gc.collect()
 
         from faster_whisper import WhisperModel
-        logger.info("Loading WhisperModel '%s' (device=%s, compute_type=%s)...", model_id, device, compute_type)
-        model = WhisperModel(model_id, device=device, compute_type=compute_type)
+        cpu_threads = max(1, min(os.cpu_count() or 4, 8))
+        logger.info("Loading WhisperModel '%s' (device=%s, compute_type=%s, cpu_threads=%d)...", model_id, device, compute_type, cpu_threads)
+        model = WhisperModel(model_id, device=device, compute_type=compute_type, cpu_threads=cpu_threads)
         _MODEL_CACHE = model
         _CACHED_MODEL_ID = model_id
         return model
@@ -178,6 +180,9 @@ def transcribe_media(
             vad_filter=vad_filter,
             vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=400) if vad_filter else None,
             beam_size=1,  # Fast, low-memory beam search
+            best_of=1,
+            temperature=0.0,
+            condition_on_previous_text=False,
         )
 
         total_duration = float(info.duration) if hasattr(info, "duration") and info.duration else 0.0
@@ -212,6 +217,9 @@ def transcribe_media(
                 language=lang_param,
                 vad_filter=False,
                 beam_size=1,
+                best_of=1,
+                temperature=0.0,
+                condition_on_previous_text=False,
             )
             info = fallback_info
             total_duration = float(fallback_info.duration) if hasattr(fallback_info, "duration") and fallback_info.duration else total_duration
@@ -364,8 +372,9 @@ def render_video_with_subtitles(
                 "-filter_complex", f"[0:v]subtitles='{escaped_srt}':force_style='{style}'[v]",
                 "-map", "[v]",
                 "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", "0",
                 "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
                 str(output_mp4_path),
             ]
         else:
@@ -374,30 +383,42 @@ def render_video_with_subtitles(
                 "-f", "lavfi", "-i", f"color=c=0x080f1d:s=1280x720:r=24:d={duration}",
                 "-i", str(audio_track_path),
                 "-vf", f"subtitles='{escaped_srt}':force_style='{style}'",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-crf", "24", "-threads", "0",
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
+                "-movflags", "+faststart",
                 str(output_mp4_path),
             ]
     else:
+        orig_has_audio = probe.get("has_audio", False)
         if has_video:
             cmd = [
                 "ffmpeg", "-y",
                 "-i", str(input_media_path),
                 "-vf", f"subtitles='{escaped_srt}':force_style='{style}'",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "192k",
-                str(output_mp4_path),
+                "-map", "0:v:0",
             ]
+            if orig_has_audio:
+                cmd.extend(["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"])
+            cmd.extend([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", "0",
+                "-movflags", "+faststart",
+                str(output_mp4_path),
+            ])
         else:
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "lavfi", "-i", f"color=c=0x080f1d:s=1280x720:r=24:d={duration}",
                 "-i", str(input_media_path),
                 "-vf", f"subtitles='{escaped_srt}':force_style='{style}'",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-crf", "24", "-threads", "0",
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
+                "-movflags", "+faststart",
                 str(output_mp4_path),
             ]
 
@@ -417,8 +438,9 @@ def render_video_with_subtitles(
     video_stream = next((s for s in out_streams if s.get("codec_type") == "video"), {})
     has_audio = out_probe.get("has_audio", False)
 
-    # Strictly validate that audio stream is present if an audio track was provided
-    if audio_track_path and not has_audio:
+    # Strictly validate that audio stream is present if an audio track was provided or original had audio
+    expect_audio = bool(audio_track_path and audio_track_path.exists()) or probe.get("has_audio", False)
+    if expect_audio and not has_audio:
         raise RuntimeError(
             "Rendered video failed audio validation: no audible audio stream detected in output MP4."
         )

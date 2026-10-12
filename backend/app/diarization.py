@@ -99,7 +99,15 @@ def extract_segment_features(samples: np.ndarray, sr: int = 16000) -> dict[str, 
 
     mel_energies = np.zeros(n_mels, dtype=np.float32)
 
-    for i in range(n_frames):
+    # Sub-sample frames evenly for rapid feature extraction on long segments
+    max_sample_frames = 48
+    if n_frames > max_sample_frames:
+        frame_indices = list(range(0, n_frames, max(1, n_frames // max_sample_frames)))[:max_sample_frames]
+    else:
+        frame_indices = list(range(n_frames))
+
+    processed_frames = 0
+    for i in frame_indices:
         st = i * hop_size
         frame = samples[st : st + frame_size]
         if len(frame) < frame_size:
@@ -123,6 +131,7 @@ def extract_segment_features(samples: np.ndarray, sr: int = 16000) -> dict[str, 
         if mag_sum > 1e-6:
             centroids.append(float(np.sum(freqs * mag) / mag_sum))
             mel_energies += np.dot(fbank, mag)
+        processed_frames += 1
 
     f0_med = float(np.median(f0_list)) if f0_list else 150.0
     f0_std = float(np.std(f0_list)) if len(f0_list) > 1 else 10.0
@@ -131,8 +140,8 @@ def extract_segment_features(samples: np.ndarray, sr: int = 16000) -> dict[str, 
     zcr_mean = float(np.mean(zcrs)) if zcrs else 0.05
 
     # Normalize mel energies
-    if n_frames > 0:
-        mel_energies /= n_frames
+    if processed_frames > 0:
+        mel_energies /= processed_frames
     mel_norm = mel_energies / (np.linalg.norm(mel_energies) + 1e-6)
 
     # Compose acoustically weighted 20-dim feature vector
