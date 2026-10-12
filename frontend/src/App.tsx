@@ -69,6 +69,8 @@ import { PronunciationDictionaryStudio } from './components/PronunciationDiction
 import { HelpCenterStudio } from './components/HelpCenterStudio';
 import { InteractiveOnboardingWizard } from './components/InteractiveOnboardingWizard';
 import { ContextualHelp } from './components/ContextualHelp';
+import { MediaUploadController, UploadProgressInfo } from './services/mediaUploadService';
+import { MediaUploadProgressCard } from './components/MediaUploadProgressCard';
 import {
   CambodianCulturalBackground,
   KhmerLotusMotif,
@@ -986,6 +988,8 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(false);
 
   const fileRef = useRef<HTMLInputElement>(null);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressInfo | null>(null);
+  const uploadControllerRef = useRef<MediaUploadController | null>(null);
   const [voices, setVoices] = useState<VoiceInfo[]>([]);
   const [translationSegments, setTranslationSegments] = useState<TranscriptSegment[]>([]);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error' | 'idle'>('saved');
@@ -1364,13 +1368,86 @@ export default function App() {
       return;
     }
 
-    if (file.size > 2048 * 1024 * 1024) {
-      setError('ឯកសារធំជាងទំហំកំណត់ 2048 MB។ សូមជ្រើសរើសឯកសារតូចជាងនេះ។');
+    if (file.size > 4096 * 1024 * 1024) {
+      setError('ឯកសារធំជាងទំហំកំណត់ 4096 MB (4 GB)។ សូមជ្រើសរើសឯកសារតូចជាងនេះ។');
       return;
     }
 
+    if (uploadProgress && ['uploading', 'paused'].includes(uploadProgress.phase)) {
+      if (uploadControllerRef.current) {
+        uploadControllerRef.current.cancel();
+        uploadControllerRef.current = null;
+      }
+      setUploadProgress(null);
+    }
+
     setSelectedFile(file);
+    setSection('Workspace');
     setNotice(`បានជ្រើសរើសឯកសារ: ${file.name} (${fmtFileSize(file.size)})`);
+  };
+
+  // Upload Controls: Pause, Resume, Cancel, Retry
+  const handlePauseUpload = () => {
+    if (uploadControllerRef.current) {
+      uploadControllerRef.current.pause();
+      setBusy(false);
+    }
+  };
+
+  const handleResumeUpload = async () => {
+    if (!uploadControllerRef.current) return;
+    setBusy(true);
+    setError('');
+    setStatusStage('កំពុង Upload ឯកសារមេឌៀទៅកាន់ម៉ាស៊ីនបម្រើ...');
+    try {
+      const completedJob = await uploadControllerRef.current.resume();
+      if (completedJob) {
+        setActive(completedJob);
+        setSelectedFile(null);
+        setUploadProgress(null);
+        uploadControllerRef.current = null;
+        await loadState();
+
+        const isBeginner = workflowMode === 'beginner';
+        await runTranscription(
+          completedJob.id,
+          selectedModel,
+          selectedSourceLang,
+          selectedTargetLang,
+          true,
+          true,
+          isBeginner
+        );
+      }
+    } catch (err: any) {
+      setError(err instanceof Error ? err.message : 'ការបន្ត Upload បរាជ័យ');
+    } finally {
+      setBusy(false);
+      setStatusStage('');
+    }
+  };
+
+  const handleCancelUpload = async () => {
+    if (uploadControllerRef.current) {
+      await uploadControllerRef.current.cancel();
+      uploadControllerRef.current = null;
+    }
+    setUploadProgress(null);
+    setBusy(false);
+    setStatusStage('');
+    setNotice('ការ Upload ត្រូវបានបោះបង់ និងសម្អាតរួចរាល់ (Upload cancelled)');
+  };
+
+  const handleRetryUpload = () => {
+    if (uploadControllerRef.current && uploadProgress?.phase === 'failed') {
+      handleResumeUpload();
+    } else if (selectedFile) {
+      if (workflowMode === 'beginner') {
+        handleBeginnerTranslateAndDub();
+      } else {
+        handleUploadAndTranscribe();
+      }
+    }
   };
 
   // Upload and Transcribe workflow
@@ -1380,27 +1457,30 @@ export default function App() {
     setError('');
     setStatusStage('កំពុង Upload ឯកសារមេឌៀទៅកាន់ម៉ាស៊ីនបម្រើ...');
 
+    const controller = new MediaUploadController(selectedFile, {
+      apiBase: API,
+      sourceLang: selectedSourceLang,
+      targetLang: selectedTargetLang,
+      onProgress: (info) => {
+        setUploadProgress(info);
+      },
+    });
+    uploadControllerRef.current = controller;
+
     try {
-      const fd = new FormData();
-      fd.append('video', selectedFile);
-      fd.append('source_language', selectedSourceLang);
-      fd.append('target_language', selectedTargetLang);
-
-      const uploadRes = await fetch(`${API}/api/jobs`, {
-        method: 'POST',
-        body: fd,
-      });
-
-      const uploadedJob = await uploadRes.json();
-      if (!uploadRes.ok) {
-        throw new Error(uploadedJob.detail || 'ការ Upload បរាជ័យ');
+      const uploadedJob = await controller.start();
+      if (!uploadedJob) {
+        // Paused or cancelled
+        return;
       }
 
       setActive(uploadedJob);
       setSelectedFile(null);
+      setUploadProgress(null);
+      uploadControllerRef.current = null;
       await loadState();
 
-      await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true);
+      await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'ដំណើរការបរាជ័យ');
     } finally {
@@ -1460,21 +1540,37 @@ export default function App() {
     if (selectedFile) {
       setBusy(true);
       setError('');
-      setStatusStage('កំពុង Upload វីដេអូទៅកាន់ម៉ាស៊ីនបម្រើ...');
+      setStatusStage('កំពុង Upload ឯកសារមេឌៀទៅកាន់ម៉ាស៊ីនបម្រើ...');
+
+      const controller = new MediaUploadController(selectedFile, {
+        apiBase: API,
+        sourceLang: selectedSourceLang,
+        targetLang: selectedTargetLang,
+        onProgress: (info) => {
+          setUploadProgress(info);
+        },
+      });
+      uploadControllerRef.current = controller;
+
       try {
-        const formData = new FormData();
-        formData.append('file', selectedFile);
-        const res = await fetch(`${API}/api/upload`, {
-          method: 'POST',
-          body: formData,
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Upload failed');
+        const uploadedJob = await controller.start();
+        if (!uploadedJob) {
+          // Paused or cancelled
+          return;
+        }
+
+        setActive(uploadedJob);
         setSelectedFile(null);
-        await runTranscription(data.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, true);
+        setUploadProgress(null);
+        uploadControllerRef.current = null;
+        await loadState();
+
+        await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, true);
       } catch (err: any) {
-        setError(err.message || 'Upload failed');
+        setError(err instanceof Error ? err.message : 'Upload failed');
+      } finally {
         setBusy(false);
+        setStatusStage('');
       }
     } else if (active) {
       await runTranscription(active.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, true);
@@ -1759,35 +1855,7 @@ export default function App() {
       {/* Main Container */}
       <main className="main">
         <header className="topbar">
-          <div className="breadcrumbs" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-
-            Projects <span>/</span> <b>{section}</b>
-            {active && (
-              <>
-                <span>/</span>
-                <span style={{ color: 'var(--text)', fontWeight: 600 }}>
-                  {active.name || active.filename}
-                </span>
-                {saveStatus === 'saving' && (
-                  <span className="autosave-badge autosave-saving">
-                    <Loader2 size={11} className="spin" /> រក្សាទុក...
-                  </span>
-                )}
-                {saveStatus === 'saved' && (
-                  <span className="autosave-badge autosave-saved">
-                    <CheckCircle2 size={11} /> បានរក្សាទុក
-                  </span>
-                )}
-                {saveStatus === 'error' && (
-                  <span className="autosave-badge autosave-error">
-                    <AlertCircle size={11} /> បរាជ័យរក្សាទុក
-                  </span>
-                )}
-              </>
-            )}
-          </div>
-
-          <div className="top-actions">
+          <div className="topbar-left">
             <button
               className="icon-btn mobile-menu"
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
@@ -1796,6 +1864,35 @@ export default function App() {
               <Menu size={18} />
             </button>
 
+            <div className="breadcrumbs">
+              <span>Projects</span> <span>/</span> <b>{section}</b>
+              {active && (
+                <>
+                  <span>/</span>
+                  <span className="breadcrumb-project-title" title={active.name || active.filename}>
+                    {active.name || active.filename}
+                  </span>
+                  {saveStatus === 'saving' && (
+                    <span className="autosave-badge autosave-saving">
+                      <Loader2 size={11} className="spin" /> រក្សាទុក...
+                    </span>
+                  )}
+                  {saveStatus === 'saved' && (
+                    <span className="autosave-badge autosave-saved">
+                      <CheckCircle2 size={11} /> បានរក្សាទុក
+                    </span>
+                  )}
+                  {saveStatus === 'error' && (
+                    <span className="autosave-badge autosave-error">
+                      <AlertCircle size={11} /> បរាជ័យរក្សាទុក
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="top-actions">
             {/* Workflow Mode Switcher */}
             <div className="workflow-mode-tabs" role="tablist" aria-label="Workflow Mode">
               <button
@@ -1805,7 +1902,8 @@ export default function App() {
                 title="Beginner Mode: 1-Click Translate & Dub"
               >
                 <Sparkles size={13} />
-                <span>Beginner Mode (សាមញ្ញ)</span>
+                <span className="tab-full-label">Beginner Mode (សាមញ្ញ)</span>
+                <span className="tab-short-label">Beginner</span>
               </button>
               <button
                 type="button"
@@ -1814,12 +1912,13 @@ export default function App() {
                 title="Advanced Studio: Per-speaker voice overrides, timing, studio"
               >
                 <Sliders size={13} />
-                <span>Advanced Studio (កម្រិតខ្ពស់)</span>
+                <span className="tab-full-label">Advanced Studio (កម្រិតខ្ពស់)</span>
+                <span className="tab-short-label">Advanced</span>
               </button>
             </div>
 
             <span className="local-badge">
-              <span className="live-dot" /> 100% Local Processing
+              <span className="live-dot" /> <span className="local-badge-text">100% Local</span>
             </span>
             <button
               className="icon-btn"
@@ -2017,7 +2116,16 @@ export default function App() {
                           <Video size={14} /> ជំហានទី ១: ជ្រើសរើសវីដេអូ (Select Video)
                         </div>
 
-                        {selectedFile ? (
+                        {uploadProgress ? (
+                          <MediaUploadProgressCard
+                            progress={uploadProgress}
+                            filename={selectedFile?.name || active?.filename || 'Media File'}
+                            onPause={handlePauseUpload}
+                            onResume={handleResumeUpload}
+                            onCancel={handleCancelUpload}
+                            onRetry={handleRetryUpload}
+                          />
+                        ) : selectedFile ? (
                           <div className="file-preview" style={{ margin: 0 }}>
                             <div className="file-preview-icon">
                               {selectedFile.type.startsWith('video') ? <FileVideo size={20} /> : <FileAudio size={20} />}
@@ -2068,7 +2176,7 @@ export default function App() {
                           >
                             <CloudUpload size={24} style={{ color: 'var(--gold)', margin: '0 auto 8px' }} />
                             <b>ជ្រើសរើស ឬទម្លាក់វីដេអូនៅទីនេះ</b>
-                            <span style={{ fontSize: 11 }}>MP4, MKV, MOV, WEBM, MP3 · Max 2048 MB</span>
+                            <span style={{ fontSize: 11 }}>MP4, MKV, MOV, WEBM, MP3 · Resumable Chunked Upload · Max 4 GB</span>
                           </motion.button>
                         )}
                       </div>
@@ -2253,54 +2361,67 @@ export default function App() {
 
                     {!showUrlImport ? (
                       <>
-                        <motion.button
-                          animate={{ scale: drag ? 1.015 : 1 }}
-                          className={`dropzone ${drag ? 'dragging' : ''}`}
-                          onClick={() => fileRef.current?.click()}
-                          onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-                          onDragLeave={() => setDrag(false)}
-                          onDrop={(e) => {
-                            e.preventDefault();
-                            setDrag(false);
-                            handleFileSelect(e.dataTransfer.files?.[0]);
-                          }}
-                          disabled={busy}
-                        >
-                          <div className="upload-symbol">
-                            <CloudUpload size={26} />
-                          </div>
-                          <b>{busy ? 'កំពុងដំណើរការ...' : 'ទម្លាក់ឯកសារ ឬចុចដើម្បីជ្រើសរើស'}</b>
-                          <span>or <u>browse audio/video</u> from your device</span>
-                          <small>MP4, MKV, MOV, WEBM, MP3, WAV, M4A, FLAC, OGG · Max 2048 MB</small>
-                        </motion.button>
-
-                        {/* Selected File Details */}
-                        <AnimatePresence>
-                          {selectedFile && (
-                            <motion.div
-                              initial={{ opacity: 0, y: 6 }}
-                              animate={{ opacity: 1, y: 0 }}
-                              exit={{ opacity: 0, y: -6 }}
-                              className="file-preview"
+                        {uploadProgress ? (
+                          <MediaUploadProgressCard
+                            progress={uploadProgress}
+                            filename={selectedFile?.name || active?.filename || 'Media File'}
+                            onPause={handlePauseUpload}
+                            onResume={handleResumeUpload}
+                            onCancel={handleCancelUpload}
+                            onRetry={handleRetryUpload}
+                          />
+                        ) : (
+                          <>
+                            <motion.button
+                              animate={{ scale: drag ? 1.015 : 1 }}
+                              className={`dropzone ${drag ? 'dragging' : ''}`}
+                              onClick={() => fileRef.current?.click()}
+                              onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+                              onDragLeave={() => setDrag(false)}
+                              onDrop={(e) => {
+                                e.preventDefault();
+                                setDrag(false);
+                                handleFileSelect(e.dataTransfer.files?.[0]);
+                              }}
+                              disabled={busy}
                             >
-                              <div className="file-preview-icon">
-                                {selectedFile.type.startsWith('video') ? <FileVideo size={20} /> : <FileAudio size={20} />}
+                              <div className="upload-symbol">
+                                <CloudUpload size={26} />
                               </div>
-                              <div className="file-preview-info">
-                                <b>{selectedFile.name}</b>
-                                <small>{fmtFileSize(selectedFile.size)} · {selectedFile.type || 'Media File'}</small>
-                              </div>
-                              <button
-                                className="icon-btn"
-                                onClick={() => setSelectedFile(null)}
-                                title="Remove file"
-                                aria-label="Remove selected file"
-                              >
-                                <X size={15} />
-                              </button>
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
+                              <b>{busy ? 'កំពុងដំណើរការ...' : 'ទម្លាក់ឯកសារ ឬចុចដើម្បីជ្រើសរើស'}</b>
+                              <span>or <u>browse audio/video</u> from your device</span>
+                              <small>MP4, MKV, MOV, WEBM, MP3, WAV, M4A, FLAC, OGG · Resumable Chunked Upload · Max 4 GB</small>
+                            </motion.button>
+
+                            {/* Selected File Details */}
+                            <AnimatePresence>
+                              {selectedFile && (
+                                <motion.div
+                                  initial={{ opacity: 0, y: 6 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, y: -6 }}
+                                  className="file-preview"
+                                >
+                                  <div className="file-preview-icon">
+                                    {selectedFile.type.startsWith('video') ? <FileVideo size={20} /> : <FileAudio size={20} />}
+                                  </div>
+                                  <div className="file-preview-info">
+                                    <b>{selectedFile.name}</b>
+                                    <small>{fmtFileSize(selectedFile.size)} · {selectedFile.type || 'Media File'}</small>
+                                  </div>
+                                  <button
+                                    className="icon-btn"
+                                    onClick={() => setSelectedFile(null)}
+                                    title="Remove file"
+                                    aria-label="Remove selected file"
+                                  >
+                                    <X size={15} />
+                                  </button>
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </>
+                        )}
                       </>
                     ) : (
                       <div style={{ background: 'var(--panel2)', border: '1px solid var(--line)', borderRadius: 10, padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>

@@ -65,6 +65,11 @@ from .schemas import (
     SystemDiagnosticsResponse,
     TranscriptSegment,
     TranscriptUpdateRequest,
+    UploadChunkResponse,
+    UploadCompleteRequest,
+    UploadInitRequest,
+    UploadInitResponse,
+    UploadStatusResponse,
     VideoExportRequest,
     VoiceInfo,
 )
@@ -357,6 +362,349 @@ async def _save_upload_and_validate(video: UploadFile) -> tuple[str, str, Path, 
         )
 
     return job_id, original_name, target_path, duration
+
+
+CHUNK_UPLOAD_DIR = (UPLOAD_DIR / ".chunks").resolve()
+CHUNK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _clean_expired_upload_sessions(max_age_seconds: int = 86400) -> None:
+    """Purges incomplete upload directories older than 24 hours."""
+    now = time.time()
+    try:
+        for p in CHUNK_UPLOAD_DIR.iterdir():
+            if p.is_dir():
+                try:
+                    if (now - p.stat().st_mtime) > max_age_seconds:
+                        shutil.rmtree(p, ignore_errors=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+@app.post("/api/upload/init", response_model=UploadInitResponse)
+async def init_chunked_upload(req: UploadInitRequest):
+    """Initializes a resumable chunked media upload session."""
+    original_name = req.filename or "media.mp4"
+    ext = Path(original_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported media extension: '{ext or '(none)'}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    if req.file_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File size must be greater than 0 bytes.",
+        )
+    if req.file_size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds maximum upload limit of {settings.max_upload_mb} MB.",
+        )
+
+    free_mb = get_disk_free_mb(UPLOAD_DIR)
+    needed_mb = (req.file_size / (1024 * 1024)) + 50
+    if free_mb < needed_mb:
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail=f"Insufficient server storage space. Free: {free_mb} MB, Required: {int(needed_mb)} MB.",
+        )
+
+    _clean_expired_upload_sessions()
+
+    upload_id = uuid.uuid4().hex[:16]
+    session_dir = CHUNK_UPLOAD_DIR / upload_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        "upload_id": upload_id,
+        "filename": original_name,
+        "file_size": req.file_size,
+        "chunk_size": req.chunk_size,
+        "total_chunks": req.total_chunks,
+        "source_language": req.source_language or "auto",
+        "target_language": req.target_language or "km",
+        "name": req.name,
+        "uploaded_chunks": [],
+        "uploaded_bytes": 0,
+        "created_at": utcnow(),
+        "status": "in_progress",
+    }
+    meta_path = session_dir / "metadata.json"
+    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    expires_at = datetime.fromtimestamp(time.time() + 86400, timezone.utc).isoformat()
+    return UploadInitResponse(
+        upload_id=upload_id,
+        filename=original_name,
+        file_size=req.file_size,
+        chunk_size=req.chunk_size,
+        total_chunks=req.total_chunks,
+        uploaded_chunks=[],
+        expires_at=expires_at,
+    )
+
+
+@app.post("/api/upload/chunk", response_model=UploadChunkResponse)
+async def upload_media_chunk(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    chunk: UploadFile = File(...),
+):
+    """Receives and securely stores an individual chunk part for an active upload session."""
+    session_dir = CHUNK_UPLOAD_DIR / upload_id
+    meta_path = session_dir / "metadata.json"
+    if not meta_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload session '{upload_id}' not found or has expired.",
+        )
+
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to read upload session state.",
+        ) from exc
+
+    if chunk_index < 0 or chunk_index >= metadata["total_chunks"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid chunk index {chunk_index}. Total expected chunks: {metadata['total_chunks']}.",
+        )
+
+    part_file = session_dir / f"chunk_{chunk_index:05d}.part"
+    chunk_bytes = await chunk.read()
+    if not chunk_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Chunk {chunk_index} is empty.",
+        )
+
+    part_file.write_bytes(chunk_bytes)
+
+    # Recalculate uploaded chunks and bytes based on physical part files
+    part_files = sorted(session_dir.glob("chunk_*.part"))
+    uploaded_indices = []
+    total_written = 0
+    for pf in part_files:
+        try:
+            idx = int(pf.stem.split("_")[1])
+            uploaded_indices.append(idx)
+            total_written += pf.stat().st_size
+        except (ValueError, IndexError):
+            continue
+
+    metadata["uploaded_chunks"] = sorted(set(uploaded_indices))
+    metadata["uploaded_bytes"] = total_written
+    metadata["updated_at"] = utcnow()
+    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    return UploadChunkResponse(
+        upload_id=upload_id,
+        chunk_index=chunk_index,
+        uploaded_chunks=metadata["uploaded_chunks"],
+        uploaded_bytes=metadata["uploaded_bytes"],
+        total_chunks=metadata["total_chunks"],
+        file_size=metadata["file_size"],
+        is_complete=(len(metadata["uploaded_chunks"]) == metadata["total_chunks"]),
+    )
+
+
+@app.get("/api/upload/status/{upload_id}", response_model=UploadStatusResponse)
+async def get_upload_status(upload_id: str):
+    """Retrieves current chunk progress for resumable uploads without double counting."""
+    session_dir = CHUNK_UPLOAD_DIR / upload_id
+    meta_path = session_dir / "metadata.json"
+    if not meta_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload session '{upload_id}' not found.",
+        )
+
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to read upload session state.",
+        ) from exc
+
+    # Confirm actual part files
+    part_files = sorted(session_dir.glob("chunk_*.part"))
+    uploaded_indices = []
+    total_written = 0
+    for pf in part_files:
+        try:
+            idx = int(pf.stem.split("_")[1])
+            uploaded_indices.append(idx)
+            total_written += pf.stat().st_size
+        except (ValueError, IndexError):
+            continue
+
+    return UploadStatusResponse(
+        upload_id=upload_id,
+        filename=metadata["filename"],
+        file_size=metadata["file_size"],
+        chunk_size=metadata["chunk_size"],
+        total_chunks=metadata["total_chunks"],
+        uploaded_chunks=sorted(set(uploaded_indices)),
+        uploaded_bytes=total_written,
+        status=metadata.get("status", "in_progress"),
+    )
+
+
+@app.post("/api/upload/complete", response_model=JobResponse)
+async def complete_chunked_upload(
+    upload_id: str = Form(None),
+    source_language: str = Form(None),
+    target_language: str = Form(None),
+    name: str | None = Form(None),
+    payload: UploadCompleteRequest | None = None,
+):
+    """Assembles received chunks, validates media with ffprobe, and initializes the translation job."""
+    eff_upload_id = upload_id or (payload.upload_id if payload else None)
+    if not eff_upload_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing upload_id parameter.",
+        )
+
+    session_dir = CHUNK_UPLOAD_DIR / eff_upload_id
+    meta_path = session_dir / "metadata.json"
+    if not meta_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload session '{eff_upload_id}' not found or already completed.",
+        )
+
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    total_chunks = metadata["total_chunks"]
+    original_name = metadata["filename"]
+    ext = Path(original_name).suffix.lower()
+
+    # Verify all parts exist
+    for idx in range(total_chunks):
+        expected_part = session_dir / f"chunk_{idx:05d}.part"
+        if not expected_part.exists():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing chunk index {idx} of {total_chunks}. Please upload missing chunks before completing.",
+            )
+
+    job_id = uuid.uuid4().hex[:12]
+    target_path = UPLOAD_DIR / f"{job_id}{ext}"
+
+    try:
+        with target_path.open("wb") as out:
+            for idx in range(total_chunks):
+                part_file = session_dir / f"chunk_{idx:05d}.part"
+                with part_file.open("rb") as src:
+                    shutil.copyfileobj(src, out)
+    except Exception as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error assembling chunked upload: {exc}",
+        ) from exc
+
+    # Validate media with ffprobe
+    try:
+        probe_info = await asyncio.to_thread(probe_media_file, target_path)
+        duration = float(probe_info.get("duration", 0.0))
+    except Exception as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Media validation failed for assembled file: {exc}",
+        ) from exc
+
+    # Clean up upload session
+    shutil.rmtree(session_dir, ignore_errors=True)
+
+    eff_src = source_language or (payload.source_language if payload else None) or metadata.get("source_language") or "auto"
+    eff_tgt = target_language or (payload.target_language if payload else None) or metadata.get("target_language") or "km"
+    eff_name = name or (payload.name if payload else None) or metadata.get("name") or Path(original_name).stem
+
+    job = {
+        "id": job_id,
+        "filename": original_name,
+        "name": (eff_name.strip() if eff_name and eff_name.strip() else Path(original_name).stem),
+        "status": "uploaded",
+        "stage": "queued",
+        "progress": 0,
+        "message": "ឯកសារបាន Upload និងផ្គុំដោយជោគជ័យ។ រួចរាល់សម្រាប់ Transcribe។",
+        "created_at": utcnow(),
+        "duration_seconds": duration,
+        "source_language": eff_src,
+        "target_language": eff_tgt,
+        "speakers": [],
+        "transcript": [],
+        "translation": [],
+        "error": None,
+        "stages": {},
+        "path": str(target_path),
+        "voice_settings": {},
+        "subtitle_styling": {},
+    }
+    save_job(job)
+    return safe_job(job)
+
+
+@app.delete("/api/upload/{upload_id}")
+async def cancel_chunked_upload(upload_id: str):
+    """Cancels and purges all partial chunks for an active upload session."""
+    session_dir = CHUNK_UPLOAD_DIR / upload_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+    return {"message": "Upload session cancelled and cleaned up.", "upload_id": upload_id}
+
+
+@app.post("/api/upload", response_model=JobResponse)
+async def upload_direct_media(
+    video: UploadFile | None = File(None),
+    file: UploadFile | None = File(None),
+    source_language: str = Form(default="auto"),
+    target_language: str = Form(default="km"),
+    name: str | None = Form(default=None),
+):
+    """Unified direct upload endpoint compatible with both 'video' and 'file' multipart fields."""
+    media_file = video or file
+    if not media_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No media file provided in request. Expecting 'video' or 'file' multipart field.",
+        )
+    job_id, original_name, target_path, duration = await _save_upload_and_validate(media_file)
+
+    job = {
+        "id": job_id,
+        "filename": original_name,
+        "name": (name.strip() if name and name.strip() else Path(original_name).stem),
+        "status": "uploaded",
+        "stage": "queued",
+        "progress": 0,
+        "message": "ឯកសារបាន Upload ដោយជោគជ័យ។ រួចរាល់សម្រាប់ Transcribe។",
+        "created_at": utcnow(),
+        "duration_seconds": duration,
+        "source_language": source_language or "auto",
+        "target_language": target_language or "km",
+        "speakers": [],
+        "transcript": [],
+        "translation": [],
+        "error": None,
+        "stages": {},
+        "path": str(target_path),
+        "voice_settings": {},
+        "subtitle_styling": {},
+    }
+    save_job(job)
+    return safe_job(job)
 
 
 @app.post("/api/jobs", response_model=JobResponse)
@@ -1571,24 +1919,89 @@ def export_txt_file(
 
 
 def _find_job_media_path(job_id: str, job: dict[str, Any] | None = None) -> Path:
-    """Safely locates the uploaded media file for a job without path traversal."""
-    if not all(c.isalnum() or c in "-_" for c in job_id):
+    """
+    Safely locates the media file associated with a job across development
+    and production deployments without path traversal vulnerabilities.
+    """
+    if not job_id or not all(c.isalnum() or c in "-_" for c in job_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job ID format")
 
-    upload_root = UPLOAD_DIR.resolve()
-    if job and job.get("path"):
-        cand = Path(job["path"]).resolve()
-        if cand.is_file() and cand.exists():
-            return cand
+    if job is None:
+        job = get_job(job_id)
 
-    for ext in ALLOWED_EXTENSIONS:
-        cand = (upload_root / f"{job_id}{ext}").resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    output_root = OUTPUT_DIR.resolve()
+    base_root = BASE_DIR.resolve()
+    import tempfile
+    temp_roots = [Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve()]
+
+    def _is_safe_file(cand: Path) -> bool:
         try:
-            cand.relative_to(upload_root)
-            if cand.is_file() and cand.exists():
-                return cand
-        except ValueError:
-            pass
+            cand_resolved = cand.resolve()
+            if not cand_resolved.is_file() or not cand_resolved.exists() or cand_resolved.stat().st_size == 0:
+                return False
+            # Verify no path traversal outside allowed directories
+            for allowed in [upload_root, output_root, base_root] + temp_roots:
+                try:
+                    cand_resolved.relative_to(allowed)
+                    return True
+                except ValueError:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    # 1. Check job's recorded path (both exact and re-anchored to current upload_root/base_root)
+    if job and job.get("path"):
+        raw_path = Path(job["path"])
+        candidates = [
+            raw_path,
+            upload_root / raw_path.name,
+            upload_root / f"{job_id}{raw_path.suffix}",
+            base_root / raw_path,
+        ]
+        for cand in candidates:
+            if _is_safe_file(cand):
+                return cand.resolve()
+
+    # 2. Check original filename recorded on job
+    if job and job.get("filename"):
+        fn_path = Path(job["filename"])
+        candidates = [
+            upload_root / fn_path.name,
+            upload_root / f"{job_id}{fn_path.suffix.lower()}",
+            upload_root / f"{job_id}_{fn_path.name}",
+        ]
+        for cand in candidates:
+            if _is_safe_file(cand):
+                return cand.resolve()
+
+    # 3. Check standard allowed extensions matching job_id in UPLOAD_DIR
+    for ext in ALLOWED_EXTENSIONS:
+        cand = upload_root / f"{job_id}{ext}"
+        if _is_safe_file(cand):
+            return cand.resolve()
+
+    # 4. Glob check in UPLOAD_DIR for files matching job_id
+    try:
+        for cand in upload_root.glob(f"{job_id}.*"):
+            if cand.suffix.lower() in ALLOWED_EXTENSIONS and _is_safe_file(cand):
+                return cand.resolve()
+        for cand in upload_root.glob(f"{job_id}_*"):
+            if cand.suffix.lower() in ALLOWED_EXTENSIONS and _is_safe_file(cand):
+                return cand.resolve()
+    except Exception:
+        pass
+
+    # 5. Check clean WAV audio file
+    clean_wav = upload_root / f"{job_id}_clean.wav"
+    if _is_safe_file(clean_wav):
+        return clean_wav.resolve()
+
+    # 6. Check rendered or intermediate files in OUTPUT_DIR
+    for cand in [output_root / f"{job_id}_rendered.mp4", output_root / f"{job_id}.mp4"]:
+        if _is_safe_file(cand):
+            return cand.resolve()
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found for this job")
 
@@ -1931,6 +2344,28 @@ async def generate_dubbing_for_job(job_id: str, payload: DubbingRequest = Dubbin
             detail="No transcript or translation available to dub. Translate or transcribe the media first.",
         )
 
+    # Resolve and validate media_path prior to dubbing generation
+    media_path: Path | None = None
+    try:
+        cand_path = _find_job_media_path(job_id, job)
+        if cand_path.is_file() and cand_path.exists() and cand_path.stat().st_size > 0:
+            media_path = cand_path
+    except HTTPException:
+        # Check if clean audio was cached as fallback
+        cand_clean = (UPLOAD_DIR / f"{job_id}_clean.wav").resolve()
+        if cand_clean.is_file() and cand_clean.exists() and cand_clean.stat().st_size > 0:
+            media_path = cand_clean
+            logger.info("Using clean WAV as media path fallback for job %s: %s", job_id, media_path)
+    except Exception as exc:
+        logger.warning("Error resolving media path for job %s: %s", job_id, exc)
+
+    # If original mixing is requested but media file is missing, log warning
+    if payload.mix_original and (media_path is None or not media_path.exists()):
+        logger.warning(
+            "Original media file is missing for job %s; dubbing will proceed without soundtrack mixing.",
+            job_id,
+        )
+
     # Build speaker voice lookup from job's speaker profiles if not in payload
     speaker_voices = dict(payload.speaker_voices)
     speaker_rates = dict(payload.speaker_rates)
@@ -1968,10 +2403,9 @@ async def generate_dubbing_for_job(job_id: str, payload: DubbingRequest = Dubbin
             speaker_rates=speaker_rates,
             total_duration=float(job.get("duration_seconds", 10.0) or 10.0),
             original_media_path=media_path,
-            preserve_nonverbal=payload.preserve_nonverbal,
+            preserve_nonverbal=bool(payload.preserve_nonverbal and media_path and media_path.exists()),
         )
 
-        media_path = _find_job_media_path(job_id, job)
         if payload.mix_original and media_path and media_path.exists():
             update_job(
                 job_id,

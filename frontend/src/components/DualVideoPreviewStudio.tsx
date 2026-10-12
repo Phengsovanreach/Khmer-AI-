@@ -381,7 +381,7 @@ export const DualVideoPreviewStudio: React.FC<DualVideoPreviewStudioProps> = ({
           display: 'grid',
           gridTemplateColumns:
             layoutMode === 'side_by_side'
-              ? 'repeat(auto-fit, minmax(420px, 1fr))'
+              ? 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))'
               : '1fr',
           gap: 16,
           marginBottom: 16,
@@ -651,7 +651,7 @@ export const DualVideoPreviewStudio: React.FC<DualVideoPreviewStudioProps> = ({
         {/* Playback Action Buttons & Audio Track Selector */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
           {/* Left: Play/Pause/Restart/Speed */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             {/* Play/Pause Button */}
             <motion.button
               whileTap={{ scale: 0.95 }}

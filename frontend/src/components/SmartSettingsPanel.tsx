@@ -81,6 +81,7 @@ export const SmartSettingsPanel: React.FC<SmartSettingsPanelProps> = ({
           display: 'flex',
           alignItems: 'center',
           gap: 10,
+          flexWrap: 'wrap',
           marginBottom: 16,
           borderBottom: '1px solid var(--line)',
           paddingBottom: 10,

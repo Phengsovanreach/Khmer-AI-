@@ -839,7 +839,7 @@ export const HelpCenterStudio: React.FC<HelpCenterStudioProps> = ({
           </button>
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', gap: 14 }}>
           {filteredSections.map((sec) => {
             const Icon = sec.icon;
             const isSelected = activeSectionId === sec.id;

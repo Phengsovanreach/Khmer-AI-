@@ -409,3 +409,56 @@ class ProofreadSampleRequest(BaseModel):
     source_text: str = ""
     style: str = "conversational"
 
+
+# =========================================================================
+# CHUNKED & RESUMABLE MEDIA UPLOAD SCHEMAS
+# =========================================================================
+
+class UploadInitRequest(BaseModel):
+    filename: str
+    file_size: int
+    chunk_size: int = 5 * 1024 * 1024  # default 5MB chunks
+    total_chunks: int
+    source_language: str = "auto"
+    target_language: str = "km"
+    name: str | None = None
+
+
+class UploadInitResponse(BaseModel):
+    upload_id: str
+    filename: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
+    uploaded_chunks: list[int] = []
+    expires_at: str
+
+
+class UploadChunkResponse(BaseModel):
+    upload_id: str
+    chunk_index: int
+    uploaded_chunks: list[int]
+    uploaded_bytes: int
+    total_chunks: int
+    file_size: int
+    is_complete: bool
+
+
+class UploadStatusResponse(BaseModel):
+    upload_id: str
+    filename: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
+    uploaded_chunks: list[int]
+    uploaded_bytes: int
+    status: str  # "in_progress", "completed", "failed", "cancelled"
+
+
+class UploadCompleteRequest(BaseModel):
+    upload_id: str
+    source_language: str = "auto"
+    target_language: str = "km"
+    name: str | None = None
+
+
