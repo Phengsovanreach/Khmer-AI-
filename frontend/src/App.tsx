@@ -2062,7 +2062,7 @@ export default function App() {
                         : 'ជ្រើសរើសឯកសារអូឌីយ៉ូ ឬវីដេអូ ដើម្បីចាប់ផ្ដើមស្គាល់សំឡេង។'}
                     </p>
                   </div>
-                  <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <div className="section-head-actions" style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                     <div className="workflow-mode-tabs" role="tablist">
                       <button
                         type="button"
