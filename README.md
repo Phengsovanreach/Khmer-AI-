@@ -137,3 +137,4 @@ Result: **Zero TypeScript errors**, production bundle compiled cleanly in `dist/
 **© 2026 Phengsovanreach. All rights reserved.**
 
 All original code, audio processing pipelines, and designs in the Khmer Translator project are copyrighted by Phengsovanreach.
+# Khmer-AI-
