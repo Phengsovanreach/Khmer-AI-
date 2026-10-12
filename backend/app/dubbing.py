@@ -350,20 +350,10 @@ def fit_speech_audio_to_window(
     target_dur = max(0.4, window_duration)
     # If audio already fits comfortably within window (plus 5% headroom)
     if dur <= target_dur * 1.05:
-        fade_d = min(0.04, dur / 6.0)
-        fade_st = max(0.0, dur - fade_d)
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(audio_path),
-            "-af", f"afade=t=out:st={fade_st:.3f}:d={fade_d:.3f}",
-            "-c:a", "libmp3lame",
-            "-b:a", "192k",
-            str(output_path),
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-            return output_path, dur
-        return audio_path, dur
+        if output_path != audio_path:
+            import shutil
+            shutil.copy(str(audio_path), str(output_path))
+        return output_path, dur
 
     # Speech is longer than window -> speed up slightly (atempo preserves pitch without distortion)
     ratio = dur / target_dur

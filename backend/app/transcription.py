@@ -140,6 +140,7 @@ def extract_audio_stream(input_file: Path, output_wav: Path) -> Path:
         "-ar", "16000",
         "-ac", "1",
         "-c:a", "pcm_s16le",
+        "-threads", "0",
         str(output_wav),
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
