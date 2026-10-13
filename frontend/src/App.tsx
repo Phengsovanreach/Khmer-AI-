@@ -2590,14 +2590,26 @@ export default function App() {
                                     <b>{selectedFile.name}</b>
                                     <small>{fmtFileSize(selectedFile.size)} · {selectedFile.type || 'Media File'}</small>
                                   </div>
-                                  <button
-                                    className="icon-btn"
-                                    onClick={() => setSelectedFile(null)}
-                                    title="Remove file"
-                                    aria-label="Remove selected file"
-                                  >
-                                    <X size={15} />
-                                  </button>
+                                  <div className="file-preview-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+                                    <button
+                                      type="button"
+                                      className="primary-btn"
+                                      style={{ padding: '6px 14px', fontSize: 12, borderRadius: 6 }}
+                                      disabled={busy}
+                                      onClick={handleUploadAndTranscribe}
+                                    >
+                                      <WandSparkles size={14} /> Upload & Process
+                                    </button>
+                                    <button
+                                      className="icon-btn"
+                                      onClick={() => setSelectedFile(null)}
+                                      title="Remove file"
+                                      aria-label="Remove selected file"
+                                      disabled={busy}
+                                    >
+                                      <X size={15} />
+                                    </button>
+                                  </div>
                                 </motion.div>
                               )}
                             </AnimatePresence>
@@ -2676,7 +2688,7 @@ export default function App() {
                         <motion.button
                           whileTap={{ scale: 0.98 }}
                           className="primary-btn"
-                          disabled={busy || !selectedFile || !caps?.faster_whisper}
+                          disabled={busy || !selectedFile}
                           onClick={handleUploadAndTranscribe}
                           style={{ width: '100%', justifyContent: 'center' }}
                         >
