@@ -207,23 +207,50 @@ export const ProcessingProgressPanel: React.FC<ProcessingProgressPanelProps> = (
 
   const pct = Math.min(Math.max(job.progress ?? (isDone ? 100 : 0), 0), 100);
 
-  // Determine stage status for each pipeline step
+  // Determine stage status for each pipeline step with strict sequential resolution and 100% completion safeguard
   const getStageStatus = (stageId: string, supported: boolean): 'completed' | 'active' | 'pending' | 'unsupported' => {
     if (!supported) return 'unsupported';
-    if (job.stages && job.stages[stageId]) {
-      return job.stages[stageId] as any;
-    }
-    if (isDone) {
-      if (stageId === 'translating') return job.translation && job.translation.length > 0 ? 'completed' : 'pending';
+
+    // Safeguard 1: If overall pipeline reached 100% or is completed, auto-resolve all prerequisite stages to 'completed'
+    if (isDone || pct >= 100) {
+      if (stageId === 'translating') {
+        return job.translation && job.translation.length > 0 ? 'completed' : 'pending';
+      }
+      if (stageId === 'exporting') {
+        return job.has_rendered_video ? 'completed' : 'pending';
+      }
       return 'completed';
     }
+
+    // Step order index in pipeline
+    const STAGE_ORDER = ['validating', 'extracting_audio', 'transcribing', 'detecting_speakers', 'generating_subtitles', 'translating', 'exporting'];
+    const currentStageIdx = STAGE_ORDER.indexOf(job.stage || job.status || '');
+    const thisStageIdx = STAGE_ORDER.indexOf(stageId);
+
+    // Safeguard 2: If backend reports stage explicitly, check prerequisite sequential rule
+    if (job.stages && job.stages[stageId]) {
+      const explicitStatus = job.stages[stageId];
+      // If a subsequent stage is already active or completed, earlier stage MUST be completed
+      if (currentStageIdx > thisStageIdx && thisStageIdx !== -1) {
+        return 'completed';
+      }
+      return explicitStatus as any;
+    }
+
     if (isFailed || isCancelled) {
       if (job.stage === stageId) return 'active';
     }
-    if (stageId === 'validating') return pct > 5 ? 'completed' : isProcessing ? 'active' : 'pending';
-    if (stageId === 'extracting_audio') return pct > 15 ? 'completed' : pct >= 5 && isProcessing ? 'active' : 'pending';
-    if (stageId === 'transcribing') return pct > 90 ? 'completed' : pct >= 15 && isProcessing ? 'active' : 'pending';
-    if (stageId === 'generating_subtitles') return pct >= 98 ? 'completed' : pct >= 90 && isProcessing ? 'active' : 'pending';
+
+    // Safeguard 3: If current execution stage has moved ahead, previous steps are completed
+    if (currentStageIdx > thisStageIdx && thisStageIdx !== -1) {
+      return 'completed';
+    }
+
+    if (stageId === 'validating') return pct >= 10 || currentStageIdx > 0 ? 'completed' : isProcessing ? 'active' : 'pending';
+    if (stageId === 'extracting_audio') return pct >= 15 || currentStageIdx > 1 ? 'completed' : (job.stage === 'extracting_audio' || (pct >= 5 && isProcessing)) ? 'active' : 'pending';
+    if (stageId === 'transcribing') return pct >= 88 || currentStageIdx > 2 ? 'completed' : (job.stage === 'transcribing' || (pct >= 15 && isProcessing)) ? 'active' : 'pending';
+    if (stageId === 'detecting_speakers') return pct >= 95 || currentStageIdx > 3 ? 'completed' : (job.stage === 'detecting_speakers' || pct >= 88) ? 'active' : 'pending';
+    if (stageId === 'generating_subtitles') return pct >= 98 || isDone ? 'completed' : (job.stage === 'generating_subtitles' || pct >= 95) ? 'active' : 'pending';
     if (stageId === 'translating') return job.status === 'translating' ? 'active' : job.translation?.length ? 'completed' : 'pending';
     if (stageId === 'exporting') return job.has_rendered_video ? 'completed' : (job.stage === 'exporting' ? 'active' : 'pending');
     return 'pending';

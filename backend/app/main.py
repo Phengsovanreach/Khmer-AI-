@@ -1233,13 +1233,28 @@ async def _execute_transcription(
             if rate > 0.05:
                 eta = round((total_duration - processed_duration) / rate, 1)
 
+        # Stage completion is strictly sequential and verified:
+        validating_done = progress >= 10 or stage in ("extracting_audio", "transcribing", "detecting_speakers", "generating_subtitles", "completed")
+        extracting_done = progress >= 15 or stage in ("transcribing", "detecting_speakers", "generating_subtitles", "completed")
+        transcribing_done = progress >= 85 or stage in ("detecting_speakers", "generating_subtitles", "completed")
+        detecting_done = progress >= 92 or stage in ("generating_subtitles", "completed")
+        generating_done = progress >= 98 or stage == "completed" or progress >= 100
+
+        # Prerequisite safeguard: if progress reaches 100% or stage is completed, all prerequisites resolve to completed
+        if progress >= 100 or stage == "completed":
+            validating_done = True
+            extracting_done = True
+            transcribing_done = True
+            detecting_done = True
+            generating_done = True
+
         stage_statuses = {
-            "validating": "completed" if progress > 5 else "active" if stage == "validating" else "pending",
-            "extracting_audio": "completed" if progress > 15 else "active" if stage == "extracting_audio" else "pending",
-            "transcribing": "completed" if progress > 85 else "active" if stage == "transcribing" else "pending",
-            "detecting_speakers": "completed" if progress > 92 else "active" if stage == "detecting_speakers" else "pending",
-            "generating_subtitles": "completed" if progress >= 98 else "active" if stage == "generating_subtitles" else "pending",
-            "completed": "completed" if progress >= 100 else "pending",
+            "validating": "completed" if validating_done else "active" if stage == "validating" else "pending",
+            "extracting_audio": "completed" if extracting_done else "active" if stage == "extracting_audio" else "pending",
+            "transcribing": "completed" if transcribing_done else "active" if stage == "transcribing" else "pending",
+            "detecting_speakers": "completed" if detecting_done else "active" if stage == "detecting_speakers" else "pending",
+            "generating_subtitles": "completed" if generating_done else "active" if stage == "generating_subtitles" else "pending",
+            "completed": "completed" if (progress >= 100 or stage == "completed") else "pending",
         }
 
         updates = {
@@ -1288,7 +1303,7 @@ async def _execute_transcription(
             # Stage 2: Audio extraction via FFmpeg
             set_progress(
                 "extracting_audio",
-                12,
+                10,
                 "ទាញយក និងសម្រួលសំឡេងជា 16kHz Mono (Extracting audio with FFmpeg)...",
                 total_duration=total_duration,
                 persist=True,
@@ -1305,11 +1320,11 @@ async def _execute_transcription(
                 updated = update_job(job_id, {"status": "cancelled", "stage": "cancelled", "message": "Cancelled by user"}, persist_disk=True)
                 return safe_job(updated or job)
 
-            # Stage 3: Speech transcription with faster-whisper
+            # Mark Step 2 completed and transition strictly sequentially to Step 3
             set_progress(
                 "transcribing",
                 15,
-                f"ចាប់ផ្តើមស្គាល់សំឡេងដោយ Faster-Whisper ({model_id})...",
+                f"ការបំប្លែងសំឡេងរួចរាល់។ ចាប់ផ្តើមស្គាល់សំឡេងដោយ Faster-Whisper ({model_id})...",
                 total_duration=total_duration,
                 persist=True,
             )
