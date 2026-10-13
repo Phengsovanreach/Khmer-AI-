@@ -1118,7 +1118,11 @@ export default function App() {
         setJobs(jobsData);
         if (active) {
           const fresh = jobsData.find((j: Job) => j.id === active.id);
-          if (fresh) setActive(fresh);
+          if (fresh) {
+            setActive(fresh);
+          } else {
+            setActive(jobsData.length > 0 ? jobsData[0] : null);
+          }
         } else if (jobsData.length > 0) {
           setActive(jobsData[0]);
         }
@@ -1338,6 +1342,12 @@ export default function App() {
           pollInterval = setInterval(async () => {
             try {
               const res = await authFetch(`${API}/api/jobs/${active.id}`);
+              if (res.status === 404) {
+                if (pollInterval) clearInterval(pollInterval);
+                if (isMounted) setActive(null);
+                void loadState();
+                return;
+              }
               if (res.ok) {
                 const freshJob: Job = await res.json();
                 if (isMounted) {
@@ -1358,6 +1368,12 @@ export default function App() {
       pollInterval = setInterval(async () => {
         try {
           const res = await authFetch(`${API}/api/jobs/${active.id}`);
+          if (res.status === 404) {
+            if (pollInterval) clearInterval(pollInterval);
+            if (isMounted) setActive(null);
+            void loadState();
+            return;
+          }
           if (res.ok) {
             const freshJob: Job = await res.json();
             if (isMounted) {
