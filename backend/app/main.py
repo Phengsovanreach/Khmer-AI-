@@ -267,9 +267,16 @@ def get_disk_free_mb(path: Path) -> int:
         return 10240
 
 
+@app.get("/health", response_model=HealthResponse)
+def health_root():
+    """Lightweight root health probe for Render health check path and UptimeRobot."""
+    return HealthResponse(status="ok", app=settings.app_name, version=settings.app_version)
+
+
 @app.get("/api/health", response_model=HealthResponse)
 def health():
     return HealthResponse(status="ok", app=settings.app_name, version=settings.app_version)
+
 
 
 @app.get("/api/ready", response_model=ReadinessResponse)

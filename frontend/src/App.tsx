@@ -1108,6 +1108,11 @@ export default function App() {
     };
   }, [editedSegments, isDirty, active?.id]);
 
+  const activeJobIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeJobIdRef.current = active?.id || null;
+  }, [active?.id]);
+
   // Load backend state
   const loadState = async () => {
     try {
@@ -1121,15 +1126,15 @@ export default function App() {
       ]);
 
       if (resJobs.ok) {
-        const jobsData = await resJobs.json();
+        const jobsData: Job[] = await resJobs.json();
         setJobs(jobsData);
-        if (active) {
-          const fresh = jobsData.find((j: Job) => j.id === active.id);
+        const currentTargetId = activeJobIdRef.current;
+        if (currentTargetId) {
+          const fresh = jobsData.find((j: Job) => j.id === currentTargetId);
           if (fresh) {
             setActive(fresh);
-          } else {
-            setActive(jobsData.length > 0 ? jobsData[0] : null);
           }
+          // Do NOT reset to jobsData[0] if activeJobId exists but is pending or fresh
         } else if (jobsData.length > 0) {
           setActive(jobsData[0]);
         }
@@ -1317,7 +1322,8 @@ export default function App() {
 
   // Real-time EventSource (SSE) + resilient polling for active job processing
   useEffect(() => {
-    if (!active?.id) return;
+    const currentJobId = active?.id;
+    if (!currentJobId) return;
     const isTerminal = ['transcribed', 'completed', 'failed', 'cancelled'].includes(active.status);
     if (isTerminal) return;
 
@@ -1326,7 +1332,7 @@ export default function App() {
     let pollInterval: ReturnType<typeof setInterval> | null = null;
 
     try {
-      es = new EventSource(`${API}/api/jobs/${active.id}/events`);
+      es = new EventSource(`${API}/api/jobs/${currentJobId}/events`);
       es.onmessage = (event) => {
         if (!isMounted) return;
         try {
@@ -1348,17 +1354,19 @@ export default function App() {
         if (!pollInterval && isMounted) {
           pollInterval = setInterval(async () => {
             try {
-              const res = await authFetch(`${API}/api/jobs/${active.id}`);
+              const res = await authFetch(`${API}/api/jobs/${currentJobId}`);
               if (res.status === 404) {
                 if (pollInterval) clearInterval(pollInterval);
-                if (isMounted) setActive(null);
+                if (isMounted) {
+                  setActive((prev) => (prev?.id === currentJobId ? null : prev));
+                }
                 void loadState();
                 return;
               }
               if (res.ok) {
                 const freshJob: Job = await res.json();
                 if (isMounted) {
-                  setActive(freshJob);
+                  setActive((prev) => (prev?.id === freshJob.id ? { ...prev, ...freshJob } : prev));
                   if (['transcribed', 'completed', 'failed', 'cancelled'].includes(freshJob.status)) {
                     if (pollInterval) clearInterval(pollInterval);
                     void loadState();
@@ -1374,17 +1382,19 @@ export default function App() {
     } catch {
       pollInterval = setInterval(async () => {
         try {
-          const res = await authFetch(`${API}/api/jobs/${active.id}`);
+          const res = await authFetch(`${API}/api/jobs/${currentJobId}`);
           if (res.status === 404) {
             if (pollInterval) clearInterval(pollInterval);
-            if (isMounted) setActive(null);
+            if (isMounted) {
+              setActive((prev) => (prev?.id === currentJobId ? null : prev));
+            }
             void loadState();
             return;
           }
           if (res.ok) {
             const freshJob: Job = await res.json();
             if (isMounted) {
-              setActive(freshJob);
+              setActive((prev) => (prev?.id === freshJob.id ? { ...prev, ...freshJob } : prev));
               if (['transcribed', 'completed', 'failed', 'cancelled'].includes(freshJob.status)) {
                 if (pollInterval) clearInterval(pollInterval);
                 void loadState();

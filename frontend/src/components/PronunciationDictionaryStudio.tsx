@@ -31,7 +31,15 @@ export const PronunciationDictionaryStudio: React.FC<PronunciationDictionaryStud
   const [entries, setEntries] = useState<DictionaryEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   // Form modal state
   const [showAddModal, setShowAddModal] = useState(false);
@@ -166,11 +174,13 @@ export const PronunciationDictionaryStudio: React.FC<PronunciationDictionaryStud
   };
 
   // Filter entries
+  const query = debouncedSearch.trim().toLowerCase();
   const filteredEntries = entries.filter((e) => {
     const matchSearch =
-      e.term.toLowerCase().includes(search.toLowerCase()) ||
-      e.replacement.toLowerCase().includes(search.toLowerCase()) ||
-      (e.notes && e.notes.toLowerCase().includes(search.toLowerCase()));
+      !query ||
+      e.term.toLowerCase().includes(query) ||
+      e.replacement.toLowerCase().includes(query) ||
+      (e.notes && e.notes.toLowerCase().includes(query));
 
     const matchCategory = selectedCategory === 'all' || e.category === selectedCategory;
     return matchSearch && matchCategory;

@@ -38,7 +38,6 @@ class SystemDiagnosticsResponse(BaseModel):
     concurrency_lock_active: bool
     sanitized_cors_origins: list[str]
 
-
 class ModelInfo(BaseModel):
     id: str
     name: str
