@@ -2,12 +2,10 @@ from __future__ import annotations
 from typing import Any
 from pydantic import BaseModel, Field
 
-
 class HealthResponse(BaseModel):
     status: str
     app: str
     version: str = "2.0.0"
-
 
 class ReadinessResponse(BaseModel):
     status: str
@@ -20,7 +18,6 @@ class ReadinessResponse(BaseModel):
     storage_writable: bool
     active_jobs: int = 0
     checks: dict[str, bool] = {}
-
 
 class SystemDiagnosticsResponse(BaseModel):
     app_name: str
@@ -49,7 +46,6 @@ class ModelInfo(BaseModel):
     estimated_ram_mb: int
     description: str
     is_default: bool = False
-
 
 class ModelsResponse(BaseModel):
     models: list[ModelInfo]

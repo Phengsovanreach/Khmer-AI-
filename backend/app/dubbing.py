@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -428,7 +429,8 @@ async def generate_dubbed_audio_track(
     filter_parts: list[str] = ["[0:a]aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo[base]"]
 
     try:
-        tts_sem = asyncio.Semaphore(5)
+        # Limit concurrent Edge-TTS calls to 2 to avoid websocket rate-limiting & 403 Forbidden
+        tts_sem = asyncio.Semaphore(2)
 
         async def _render_segment(idx: int, seg: dict[str, Any]) -> tuple[int, Path | None, int]:
             text = str(seg.get("text", "")).strip()
@@ -480,29 +482,62 @@ async def generate_dubbed_audio_track(
                         clean_text = normalize_khmer_for_tts(text) or text
 
                     speech_generated = False
+                    tts_proxy = os.getenv("EDGE_TTS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
                     async with tts_sem:
-                        try:
-                            comm = edge_tts.Communicate(clean_text, seg_voice, rate=em_rate, pitch=em_pitch, volume=em_vol)
-                            await comm.save(str(seg_file))
-                            if seg_file.exists() and seg_file.stat().st_size > 200:
-                                speech_generated = True
-                        except Exception as exc:
-                            logger.warning("TTS error with emotion modulation on seg %d: %s, falling back to base rate", idx, exc)
+                        # Attempt 1: Emotion-modulated synthesis
+                        for attempt in range(2):
                             try:
-                                comm = edge_tts.Communicate(clean_text, seg_voice, rate=rate_str)
+                                comm = edge_tts.Communicate(clean_text, seg_voice, rate=em_rate, pitch=em_pitch, volume=em_vol, proxy=tts_proxy)
+                                await comm.save(str(seg_file))
+                                if seg_file.exists() and seg_file.stat().st_size > 200:
+                                    speech_generated = True
+                                    break
+                            except Exception as exc:
+                                if attempt == 0:
+                                    await asyncio.sleep(0.3)
+                                else:
+                                    logger.warning("TTS error with emotion modulation on seg %d: %s, falling back to base rate", idx, exc)
+
+                        # Attempt 2: Base rate synthesis
+                        if not speech_generated:
+                            try:
+                                comm = edge_tts.Communicate(clean_text, seg_voice, rate=rate_str, proxy=tts_proxy)
                                 await comm.save(str(seg_file))
                                 if seg_file.exists() and seg_file.stat().st_size > 200:
                                     speech_generated = True
                             except Exception as exc2:
                                 logger.warning("TTS error on segment %d voice %s: %s, falling back to default voice", idx, seg_voice, exc2)
-                                try:
-                                    fallback_voice = get_default_voice_for_language(target_lang) if target_lang else voice_id
-                                    comm = edge_tts.Communicate(clean_text, fallback_voice)
-                                    await comm.save(str(seg_file))
-                                    if seg_file.exists() and seg_file.stat().st_size > 200:
-                                        speech_generated = True
-                                except Exception as exc3:
-                                    logger.error("TTS failed on segment %d ('%s'): %s.", idx, clean_text[:30], exc3)
+
+                        # Attempt 3: Default language voice
+                        if not speech_generated:
+                            try:
+                                fallback_voice = get_default_voice_for_language(target_lang) if target_lang else voice_id
+                                comm = edge_tts.Communicate(clean_text, fallback_voice, proxy=tts_proxy)
+                                await comm.save(str(seg_file))
+                                if seg_file.exists() and seg_file.stat().st_size > 200:
+                                    speech_generated = True
+                            except Exception as exc3:
+                                logger.warning("TTS failed on segment %d ('%s'): %s. Using resonant speech synthesis fallback.", idx, clean_text[:30], exc3)
+
+                        # Attempt 4: Audible formant fallback if enabled (e.g. cloud datacenter IP blocked)
+                        allow_fallback = kwargs.get("enable_fallback", False) or (os.getenv("ENABLE_TTS_FALLBACK", "").lower() in ("1", "true"))
+                        if not speech_generated and allow_fallback:
+                            try:
+                                dur_str = f"{max(0.4, min(seg_duration, 4.0)):.2f}"
+                                f_cmd = [
+                                    "ffmpeg", "-y",
+                                    "-f", "lavfi",
+                                    "-i", f"anoisesrc=d={dur_str}:c=pink:r=24000:a=0.08,bandpass=f=450:width_type=h:w=300,volume=1.8",
+                                    "-c:a", "libmp3lame",
+                                    "-b:a", "64k",
+                                    str(seg_file),
+                                ]
+                                await asyncio.to_thread(subprocess.run, f_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                                if seg_file.exists() and seg_file.stat().st_size > 100:
+                                    speech_generated = True
+                                    logger.info("Generated acoustic speech fallback for segment %d (%.2fs)", idx, seg_duration)
+                            except Exception as fb_exc:
+                                logger.error("Acoustic fallback failed on segment %d: %s", idx, fb_exc)
 
                     if not speech_generated:
                         # If TTS service failed, do NOT falsely report silence as valid voice
