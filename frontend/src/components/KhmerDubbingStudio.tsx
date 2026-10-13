@@ -129,7 +129,12 @@ export const KhmerDubbingStudio: React.FC<KhmerDubbingStudioProps> = ({
       await onRefreshJob();
       setNotice('ការបង្កើតសំឡេង AI Dubbing ទទួលបានជោគជ័យ!');
     } catch (err: any) {
-      setError(`កំហុសក្នុងការបង្កើត Dubbing: ${err.message || err}`);
+      const errMsg = err?.message || String(err);
+      if (errMsg.includes('Failed to fetch')) {
+        setError(`កំហុសក្នុងការបង្កើត Dubbing: មិនអាចភ្ជាប់ទៅកាន់ម៉ាស៊ីនបម្រើ API (${API}) បានទេ។ សូមពិនិត្យមើលថាតើ Render Backend កំពុងដំណើរការ ឬរង់ចាំ cold start រួចចុចសាកល្បងម្តងទៀត។`);
+      } else {
+        setError(`កំហុសក្នុងការបង្កើត Dubbing: ${errMsg}`);
+      }
     } finally {
       setIsGenerating(false);
     }
