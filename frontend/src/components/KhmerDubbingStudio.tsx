@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { Job, VoiceInfo, SpeakerProfile } from '../types';
+import { AuthService } from '../services/authService';
 
 interface KhmerDubbingStudioProps {
   job: Job;
@@ -101,9 +102,14 @@ export const KhmerDubbingStudio: React.FC<KhmerDubbingStudioProps> = ({
         }
       });
 
+      const authHeaders = AuthService.getAuthHeaders();
       const res = await fetch(`${API}/api/jobs/${job.id}/dub`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        credentials: 'include',
         body: JSON.stringify({
           voice_id: selectedVoice,
           target_language: targetLanguage,
