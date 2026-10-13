@@ -764,10 +764,14 @@ def intelligent_mix_soundtrack(
     )
 
     t_args = ["-t", f"{target_dur:.3f}"] if target_dur > 0.05 else []
+    # Dynamic timeout: scale with duration (min 180s, allowing ~0.5x realtime on low-tier CPUs for 2h audio)
+    dynamic_timeout = max(180, int(target_dur * 1.5))
 
     cmd = [
         "ffmpeg", "-y",
+        "-vn",
         "-i", str(orig_p),
+        "-vn",
         "-i", str(dub_p),
         "-filter_complex", filter_complex,
         "-map", "[out]",
@@ -778,9 +782,17 @@ def intelligent_mix_soundtrack(
         str(out_p),
     ]
 
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
-    if res.returncode != 0:
-        logger.warning("Sidechain compression mixing failed (%s), falling back to robust simple amix", res.stderr[-200:] if res.stderr else "")
+    mix_success = False
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=dynamic_timeout)
+        if res.returncode == 0:
+            mix_success = True
+        else:
+            logger.warning("Sidechain compression mixing failed (%s), falling back to robust simple amix", res.stderr[-200:] if res.stderr else "")
+    except subprocess.TimeoutExpired:
+        logger.warning("Sidechain compression mixing timed out after %ds, falling back to simple amix", dynamic_timeout)
+
+    if not mix_success:
         # Robust fallback: standard amix without sidechain
         fb_filter = (
             f"[0:a]volume={orig_vol},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=stereo,apad[a0];"
@@ -789,7 +801,9 @@ def intelligent_mix_soundtrack(
         )
         cmd_fb = [
             "ffmpeg", "-y",
+            "-vn",
             "-i", str(orig_p),
+            "-vn",
             "-i", str(dub_p),
             "-filter_complex", fb_filter,
             "-map", "[out]",
@@ -798,11 +812,18 @@ def intelligent_mix_soundtrack(
             "-b:a", "192k",
             str(out_p),
         ]
-        res_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
-        if res_fb.returncode != 0:
-            logger.error("Standard amix also failed, copying dubbed audio track directly")
-            cmd_copy = ["ffmpeg", "-y", "-i", str(dub_p), "-c:a", "libmp3lame", "-b:a", "192k", str(out_p)]
-            subprocess.run(cmd_copy, check=True)
+        try:
+            res_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=dynamic_timeout)
+            if res_fb.returncode == 0:
+                mix_success = True
+            else:
+                logger.error("Standard amix also failed (%s), copying dubbed audio track directly", res_fb.stderr[-200:] if res_fb.stderr else "")
+        except subprocess.TimeoutExpired:
+            logger.error("Standard amix timed out, copying dubbed audio track directly")
+
+    if not mix_success:
+        cmd_copy = ["ffmpeg", "-y", "-vn", "-i", str(dub_p), "-c:a", "libmp3lame", "-b:a", "192k", str(out_p)]
+        subprocess.run(cmd_copy, check=True)
 
     if not out_p.exists() or out_p.stat().st_size == 0:
         raise RuntimeError("Mixed audio file is empty or missing.")
