@@ -2524,10 +2524,13 @@ async def export_rendered_video(job_id: str, payload: VideoExportRequest = Video
             default_voice = get_default_voice_for_language(target_lang)
             chosen_voice = job.get("voice_settings", {}).get("voice_id") or default_voice
 
+            # Speech audio MUST be synthesized from translated text, not original transcript
+            dub_segments = job.get("translation") or segments
+
             raw_dubbed = OUTPUT_DIR / f"{job_id}_raw_dubbed.mp3"
             try:
                 await generate_dubbed_audio_track(
-                    segments=segments,
+                    segments=dub_segments,
                     output_audio_path=raw_dubbed,
                     voice_id=chosen_voice,
                     speaker_voices=speaker_voices,

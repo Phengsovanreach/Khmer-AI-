@@ -448,6 +448,14 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
   const [position, setPosition] = useState<'bottom' | 'center' | 'top'>('bottom');
   const [comparisonMode, setComparisonMode] = useState<'khmer_only' | 'dual'>('khmer_only');
 
+  // Audio Mode for export: 'dubbed' (replace original voice) | 'mixed' (ducking) | 'original'
+  const [audioMode, setAudioMode] = useState<'dubbed' | 'mixed' | 'original'>('dubbed');
+  // Live Preview Audio selection: 'dubbed' (plays dubbed track in sync) | 'original'
+  const [liveAudioTrack, setLiveAudioTrack] = useState<'dubbed' | 'original'>(
+    active?.has_dubbed_audio ? 'dubbed' : 'original'
+  );
+  const dubbedAudioRef = useRef<HTMLAudioElement | null>(null);
+
   const [showSettings, setShowSettings] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
@@ -482,6 +490,9 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
     if (videoRef.current) {
       videoRef.current.currentTime = time;
     }
+    if (dubbedAudioRef.current) {
+      dubbedAudioRef.current.currentTime = time;
+    }
   };
 
   // Restart Preview
@@ -489,6 +500,9 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
     if (!videoRef.current) return;
     videoRef.current.currentTime = 0;
     setCurrentTime(0);
+    if (dubbedAudioRef.current) {
+      dubbedAudioRef.current.currentTime = 0;
+    }
     videoRef.current.play().catch(() => {});
   };
 
@@ -501,12 +515,19 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
       videoRef.current.muted = val === 0;
       setIsMuted(val === 0);
     }
+    if (dubbedAudioRef.current) {
+      dubbedAudioRef.current.volume = val;
+      dubbedAudioRef.current.muted = val === 0;
+    }
   };
 
   const toggleMute = () => {
     if (!videoRef.current) return;
     const nextMuted = !isMuted;
     videoRef.current.muted = nextMuted;
+    if (dubbedAudioRef.current) {
+      dubbedAudioRef.current.muted = nextMuted;
+    }
     setIsMuted(nextMuted);
   };
 
@@ -540,8 +561,11 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
           subtitle_source: active.translation?.length ? 'translation' : 'transcript',
           font_size: fontSize === 'small' ? 18 : fontSize === 'large' ? 26 : 22,
           burn_subtitles: true,
-          include_dubbed_audio: true,
-          audio_mode: 'dubbed',
+          include_dubbed_audio: audioMode !== 'original',
+          audio_mode: audioMode,
+          voice_volume: 1.0,
+          original_volume: audioMode === 'mixed' ? 0.25 : 0.0,
+          preserve_soundtrack: audioMode === 'mixed',
         }),
       });
 
@@ -622,10 +646,30 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
         <div className="preview-mode-tabs">
           <button
             className={`preview-mode-btn ${previewMode === 'live_overlay' ? 'active' : ''}`}
-            onClick={() => setPreviewMode('live_overlay')}
+            onClick={() => {
+              setPreviewMode('live_overlay');
+              if (videoRef.current) videoRef.current.muted = isMuted;
+            }}
           >
             <Subtitles size={14} /> Live Subtitles Preview
           </button>
+          {active.has_dubbed_audio && (
+            <button
+              className={`preview-mode-btn ${previewMode === 'live_overlay' && liveAudioTrack === 'dubbed' ? 'active' : ''}`}
+              onClick={() => {
+                setPreviewMode('live_overlay');
+                setLiveAudioTrack((prev) => (prev === 'dubbed' ? 'original' : 'dubbed'));
+                setNotice(liveAudioTrack === 'dubbed' ? 'ប្ដូរទៅសំឡេងដើម (Original)' : 'ប្ដូរទៅសំឡេងបកប្រែ AI Dubbed (Target Voice)');
+              }}
+              title="Toggle target-language dubbed voice preview on video"
+              style={{
+                borderColor: liveAudioTrack === 'dubbed' ? 'var(--gold)' : undefined,
+                color: liveAudioTrack === 'dubbed' ? 'var(--gold)' : undefined,
+              }}
+            >
+              <Volume2 size={14} /> {liveAudioTrack === 'dubbed' ? 'AI Dubbed Voice (ON)' : 'AI Dubbed Voice (OFF)'}
+            </button>
+          )}
           <button
             className={`preview-mode-btn ${previewMode === 'rendered' ? 'active' : ''} ${!active.has_rendered_video ? 'disabled' : ''}`}
             onClick={() => {
@@ -692,20 +736,48 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
                 className="video-element"
                 playsInline
                 preload="metadata"
-                onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime || 0)}
+                muted={previewMode === 'live_overlay' && liveAudioTrack === 'dubbed' ? true : isMuted}
+                onTimeUpdate={() => {
+                  const t = videoRef.current?.currentTime || 0;
+                  setCurrentTime(t);
+                  if (dubbedAudioRef.current && Math.abs(dubbedAudioRef.current.currentTime - t) > 0.25) {
+                    dubbedAudioRef.current.currentTime = t;
+                  }
+                }}
                 onLoadedMetadata={() => {
                   setDuration(videoRef.current?.duration || active.duration_seconds || 0);
                   setIsLoadingVideo(false);
                 }}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
+                onPlay={() => {
+                  setIsPlaying(true);
+                  if (dubbedAudioRef.current && previewMode === 'live_overlay' && liveAudioTrack === 'dubbed') {
+                    dubbedAudioRef.current.play().catch(() => {});
+                  }
+                }}
+                onPause={() => {
+                  setIsPlaying(false);
+                  if (dubbedAudioRef.current) dubbedAudioRef.current.pause();
+                }}
                 onWaiting={() => setIsLoadingVideo(true)}
-                onPlaying={() => setIsLoadingVideo(false)}
+                onPlaying={() => {
+                  setIsLoadingVideo(false);
+                  if (dubbedAudioRef.current && previewMode === 'live_overlay' && liveAudioTrack === 'dubbed') {
+                    dubbedAudioRef.current.play().catch(() => {});
+                  }
+                }}
                 onError={() => {
                   setVideoError('Cannot stream media. File might be missing or corrupted.');
                   setIsLoadingVideo(false);
                 }}
               />
+
+              {active.has_dubbed_audio && active.dubbed_audio_url && (
+                <audio
+                  ref={dubbedAudioRef}
+                  src={active.dubbed_audio_url.startsWith('http') ? active.dubbed_audio_url : `${API}${active.dubbed_audio_url}`}
+                  preload="auto"
+                />
+              )}
 
               {/* Audio-only art if no video stream */}
               {isAudioFile && (
@@ -881,6 +953,33 @@ export const VideoPreviewStudio: React.FC<VideoPreviewStudioProps> = ({
                   onClick={() => setComparisonMode('dual')}
                 >
                   Dual (Source + Khmer)
+                </button>
+              </div>
+            </div>
+
+            <div className="preview-setting-item">
+              <span className="preview-setting-label">Audio Dubbing Mode (ជម្រើសសំឡេង)</span>
+              <div className="preview-setting-pills">
+                <button
+                  className={`preview-pill-btn ${audioMode === 'dubbed' ? 'active' : ''}`}
+                  onClick={() => setAudioMode('dubbed')}
+                  title="Replace original speech completely with target-language AI voice"
+                >
+                  Replace Voice (សំឡេងបកប្រែសុទ្ធ)
+                </button>
+                <button
+                  className={`preview-pill-btn ${audioMode === 'mixed' ? 'active' : ''}`}
+                  onClick={() => setAudioMode('mixed')}
+                  title="Intelligent ducking: keep background sound effects/music with translated voice"
+                >
+                  Keep BG Audio (លាយសំឡេងផ្ទៃខាងក្រោយ)
+                </button>
+                <button
+                  className={`preview-pill-btn ${audioMode === 'original' ? 'active' : ''}`}
+                  onClick={() => setAudioMode('original')}
+                  title="Keep original unaltered audio track"
+                >
+                  Original (សំឡេងដើម)
                 </button>
               </div>
             </div>

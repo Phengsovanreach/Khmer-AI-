@@ -1,4 +1,3 @@
-from __future__ import annotations
 import asyncio
 import json
 import logging
@@ -6,12 +5,46 @@ import os
 import re
 import subprocess
 import tempfile
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import edge_tts
 
 logger = logging.getLogger(__name__)
+
+
+def synthesize_tts_fallback(text: str, target_lang: str = "km") -> bytes:
+    """
+    Fallback TTS provider using Google Translate TTS service.
+    Guarantees audible spoken natural target-language speech even when cloud PaaS/Render IP
+    is temporarily blocked by Microsoft Edge-TTS websocket firewalls (403).
+    """
+    clean_text = text.strip()
+    if not clean_text:
+        return b""
+    # Map target language code to Google TTS language code
+    lang_code = (target_lang or "km").split("-")[0].lower()
+    # Google Translate TTS max query chunk is ~200 characters
+    chunks = [clean_text[i:i + 180] for i in range(0, len(clean_text), 180)]
+    audio_parts: list[bytes] = []
+
+    for chunk in chunks:
+        enc = urllib.parse.quote(chunk)
+        url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={enc}&tl={lang_code}&client=tw-ob"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://translate.google.com/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            audio_parts.append(resp.read())
+
+    return b"".join(audio_parts)
+
 
 # Curated verified high-quality voices per language for instant offline availability
 KHMER_VOICES = [
@@ -179,9 +212,20 @@ async def generate_speech_sample(
         tmp_path = Path(tmp.name)
 
     try:
-        communicate = edge_tts.Communicate(sample_text, voice_id)
-        await communicate.save(str(tmp_path))
-        return tmp_path.read_bytes()
+        try:
+            communicate = edge_tts.Communicate(sample_text, voice_id)
+            await communicate.save(str(tmp_path))
+            if tmp_path.exists() and tmp_path.stat().st_size > 200:
+                return tmp_path.read_bytes()
+        except Exception as exc:
+            logger.warning("edge_tts sample synthesis failed (%s), using cloud fallback TTS", exc)
+
+        # Fallback TTS
+        lang_code = voice_id.split("-")[0].lower() if "-" in voice_id else "km"
+        fb_audio = await asyncio.to_thread(synthesize_tts_fallback, sample_text, lang_code)
+        if fb_audio and len(fb_audio) > 200:
+            return fb_audio
+        return tmp_path.read_bytes() if tmp_path.exists() else fb_audio
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -209,11 +253,27 @@ async def generate_segment_audio(
         try:
             comm = edge_tts.Communicate(clean_text, voice_id, rate=em_rate, pitch=em_pitch, volume=em_vol)
             await comm.save(str(tmp_path))
+            if tmp_path.exists() and tmp_path.stat().st_size > 200:
+                return tmp_path.read_bytes()
         except Exception as exc:
-            logger.warning("TTS with emotion modulation failed on segment: %s, trying standard rate", exc)
-            comm = edge_tts.Communicate(clean_text, voice_id, rate=rate_str)
-            await comm.save(str(tmp_path))
-        return tmp_path.read_bytes()
+            logger.warning("TTS with emotion modulation failed on segment (%s), trying standard rate", exc)
+            try:
+                comm = edge_tts.Communicate(clean_text, voice_id, rate=rate_str)
+                await comm.save(str(tmp_path))
+                if tmp_path.exists() and tmp_path.stat().st_size > 200:
+                    return tmp_path.read_bytes()
+            except Exception as exc2:
+                logger.warning("Standard rate edge_tts also failed (%s), using cloud fallback TTS", exc2)
+
+        # Fallback TTS
+        lang_code = voice_id.split("-")[0].lower() if "-" in voice_id else "km"
+        fb_audio = await asyncio.to_thread(synthesize_tts_fallback, clean_text, lang_code)
+        if fb_audio and len(fb_audio) > 100:
+            return fb_audio
+
+        if tmp_path.exists() and tmp_path.stat().st_size > 0:
+            return tmp_path.read_bytes()
+        raise RuntimeError("Speech synthesis failed to produce audio bytes.")
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -519,10 +579,24 @@ async def generate_dubbed_audio_track(
                             except Exception as exc3:
                                 logger.warning("TTS failed on segment %d ('%s'): %s. Using resonant speech synthesis fallback.", idx, clean_text[:30], exc3)
 
-                        # Attempt 4: Audible formant fallback in production if cloud IP is rate-limited (403)
-                        # Disabled only when allow_fallback=False or in unit tests
+                        # Check if fallback synthesis is permitted (disabled in strict unit testing)
                         is_test_env = os.getenv("TESTING") == "1" or os.getenv("PYTEST_CURRENT_TEST") is not None
                         allow_fallback = kwargs.get("allow_fallback", not is_test_env)
+
+                        # Attempt 4: Natural spoken target-language TTS fallback (Google TTS)
+                        # Used when cloud/Render IP is rate-limited or blocked with 403 Forbidden
+                        if not speech_generated and allow_fallback:
+                            try:
+                                l_code = seg_voice.split("-")[0].lower() if "-" in seg_voice else (target_lang or "km")
+                                g_audio = await asyncio.to_thread(synthesize_tts_fallback, clean_text, l_code)
+                                if g_audio and len(g_audio) > 100:
+                                    seg_file.write_bytes(g_audio)
+                                    speech_generated = True
+                                    logger.info("Generated natural spoken target-language audio for segment %d via cloud TTS fallback", idx)
+                            except Exception as g_exc:
+                                logger.warning("Cloud TTS fallback error on segment %d: %s", idx, g_exc)
+
+                        # Attempt 5: Audible formant fallback in production if cloud IP is completely blocked
                         if not speech_generated and allow_fallback:
                             try:
                                 dur_str = f"{max(0.4, min(seg_duration, 4.0)):.2f}"
