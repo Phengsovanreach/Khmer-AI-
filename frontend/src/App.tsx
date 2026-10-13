@@ -125,7 +125,14 @@ export const getApiBase = (): string => {
   if (custom && custom.trim()) {
     return custom.trim().replace(/\/+$/, '');
   }
-  return (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+  if (import.meta.env.VITE_API_URL && import.meta.env.VITE_API_URL.trim()) {
+    return import.meta.env.VITE_API_URL.trim().replace(/\/+$/, '');
+  }
+  const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+  if (isHttps) {
+    return 'https://khmer-ai-1ktp.onrender.com';
+  }
+  return 'http://127.0.0.1:8000';
 };
 
 let API = getApiBase();
