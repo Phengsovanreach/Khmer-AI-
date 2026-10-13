@@ -775,15 +775,48 @@ async def get_upload_status(upload_id: str):
 async def complete_chunked_upload(
     request: Request,
     authorization: str | None = Header(None),
-    upload_id: str = Form(None),
-    source_language: str = Form(None),
-    target_language: str = Form(None),
-    name: str | None = Form(None),
-    payload: UploadCompleteRequest | None = None,
+    upload_id: str | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+    name: str | None = None,
 ):
     """Assembles received chunks, validates media with ffprobe, and initializes the translation job."""
     current_user = get_current_user_optional(request, authorization)
-    eff_upload_id = upload_id or (payload.upload_id if payload else None)
+    
+    eff_upload_id = upload_id
+    eff_src = source_language
+    eff_tgt = target_language
+    eff_name = name
+
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                eff_upload_id = eff_upload_id or body.get("upload_id")
+                eff_src = eff_src or body.get("source_language")
+                eff_tgt = eff_tgt or body.get("target_language")
+                eff_name = eff_name or body.get("name")
+        except Exception:
+            pass
+    else:
+        try:
+            form = await request.form()
+            eff_upload_id = eff_upload_id or form.get("upload_id")
+            eff_src = eff_src or form.get("source_language")
+            eff_tgt = eff_tgt or form.get("target_language")
+            eff_name = eff_name or form.get("name")
+        except Exception:
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    eff_upload_id = eff_upload_id or body.get("upload_id")
+                    eff_src = eff_src or body.get("source_language")
+                    eff_tgt = eff_tgt or body.get("target_language")
+                    eff_name = eff_name or body.get("name")
+            except Exception:
+                pass
+
     if not eff_upload_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -842,9 +875,9 @@ async def complete_chunked_upload(
     # Clean up upload session
     shutil.rmtree(session_dir, ignore_errors=True)
 
-    eff_src = source_language or (payload.source_language if payload else None) or metadata.get("source_language") or "auto"
-    eff_tgt = target_language or (payload.target_language if payload else None) or metadata.get("target_language") or "km"
-    eff_name = name or (payload.name if payload else None) or metadata.get("name") or Path(original_name).stem
+    eff_src = eff_src or metadata.get("source_language") or "auto"
+    eff_tgt = eff_tgt or metadata.get("target_language") or "km"
+    eff_name = eff_name or metadata.get("name") or Path(original_name).stem
 
     job = {
         "id": job_id,
@@ -931,13 +964,21 @@ async def upload_direct_media(
 async def create_job(
     request: Request,
     authorization: str | None = Header(None),
-    video: UploadFile = File(...),
+    video: UploadFile | None = File(None),
+    file: UploadFile | None = File(None),
+    media: UploadFile | None = File(None),
     source_language: str = Form(default="auto"),
     target_language: str = Form(default="km"),
     name: str | None = Form(default=None),
 ):
     current_user = get_current_user_optional(request, authorization)
-    job_id, original_name, target_path, duration = await _save_upload_and_validate(video)
+    upload_file = video or file or media
+    if not upload_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing media file. Please provide a file in field 'video', 'file', or 'media'.",
+        )
+    job_id, original_name, target_path, duration = await _save_upload_and_validate(upload_file)
 
     job = {
         "id": job_id,

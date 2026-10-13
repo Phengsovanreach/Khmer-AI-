@@ -5,4 +5,4 @@ Disallow: /api/
 Disallow: /auth/
 Disallow: /dashboard/
 
-Sitemap: https://khmer-ai-16c.pages.dev/sitemap.xml
+Sitemap: https://f50e2d76.khmer-ai-16c.pages.dev/sitemap.xml
