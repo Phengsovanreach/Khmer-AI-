@@ -146,3 +146,30 @@ def test_upload_validation_errors(client):
         "total_chunks": 1,
     })
     assert zero_size.status_code == 400
+
+
+def test_upload_duration_exceeding_2_hours_rejected(client, tmp_path, monkeypatch):
+    """Verifies that uploaded videos exceeding 2 hours (7200s) are rejected with a clear 400 error."""
+    import app.main as main_mod
+
+    # Mock ffprobe to return a video duration of 7201 seconds (over 2 hours)
+    def mock_probe_media_file(path):
+        return {
+            "duration": 7201.0,
+            "has_audio": True,
+            "has_video": True,
+            "size": 1024,
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        }
+
+    monkeypatch.setattr(main_mod, "probe_media_file", mock_probe_media_file)
+
+    test_file = tmp_path / "long_video.mp4"
+    test_file.write_bytes(b"dummy video content")
+
+    with test_file.open("rb") as f:
+        res = client.post("/api/upload", files={"file": ("long_video.mp4", f, "video/mp4")})
+
+    assert res.status_code == 400
+    assert "2 ម៉ោង" in res.json()["detail"] or "7200" in res.json()["detail"]
+

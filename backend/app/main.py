@@ -575,6 +575,14 @@ async def _save_upload_and_validate(video: UploadFile) -> tuple[str, str, Path, 
     try:
         probe_info = await asyncio.to_thread(probe_media_file, target_path)
         duration = float(probe_info.get("duration", 0.0))
+        if duration > 7200.0:
+            target_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="វីដេអូមានរយៈពេលលើសពី 2 ម៉ោង (120 នាទី)។ Video duration exceeds the maximum limit of 2 hours (7200 seconds).",
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
         target_path.unlink(missing_ok=True)
         raise HTTPException(
@@ -876,6 +884,15 @@ async def complete_chunked_upload(
     try:
         probe_info = await asyncio.to_thread(probe_media_file, target_path)
         duration = float(probe_info.get("duration", 0.0))
+        if duration > 7200.0:
+            target_path.unlink(missing_ok=True)
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="វីដេអូមានរយៈពេលលើសពី 2 ម៉ោង (120 នាទី)។ Video duration exceeds the maximum limit of 2 hours (7200 seconds).",
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
         target_path.unlink(missing_ok=True)
         raise HTTPException(

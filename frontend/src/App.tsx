@@ -2516,7 +2516,7 @@ export default function App() {
                           >
                             <CloudUpload size={24} style={{ color: 'var(--gold)', margin: '0 auto 8px' }} />
                             <b>ជ្រើសរើស ឬទម្លាក់វីដេអូនៅទីនេះ</b>
-                            <span style={{ fontSize: 11 }}>MP4, MKV, MOV, WEBM, MP3 · Resumable Chunked Upload · Max 4 GB</span>
+                            <span style={{ fontSize: 11 }}>MP4, MKV, MOV, WEBM, MP3 · រយៈពេលរហូតដល់ 2 ម៉ោង (120 នាទី) · Max 4 GB</span>
                           </motion.button>
                         )}
                       </div>
