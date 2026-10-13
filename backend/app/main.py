@@ -176,7 +176,11 @@ async def enforce_job_data_isolation(request: Request, call_next):
     """
     Security Middleware enforcing multi-tenant account data isolation.
     Guarantees private job resources cannot be inspected, modified, or deleted across accounts.
+    Allows HTTP OPTIONS CORS preflight requests to pass through immediately.
     """
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     path = request.url.path
     job_id = None
     if path.startswith("/api/jobs/"):
