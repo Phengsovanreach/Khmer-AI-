@@ -117,6 +117,8 @@ def test_export_rendered_video_and_download(tmp_path):
             "subtitle_source": "translation",
             "font_size": 22,
             "burn_subtitles": True,
+            "include_dubbed_audio": False,
+            "audio_mode": "original",
         })
         assert export_res.status_code == 200
         job_data = export_res.json()

@@ -290,16 +290,32 @@ def test_export_video_auto_dubbing_validation(tmp_path):
     try:
         # Request video export with include_dubbed_audio=True and audio_mode="dubbed"
         # The dubbed mp3 does not exist yet; backend should auto-synthesize it and verify audio stream in mp4!
-        res = client.post(
-            f"/api/jobs/{job_id}/export-video",
-            json={
-                "subtitle_source": "translation",
-                "font_size": 20,
-                "burn_subtitles": True,
-                "include_dubbed_audio": True,
-                "audio_mode": "dubbed",
-            },
-        )
+        # In CI runner environments, external edge-tts endpoints may return 403, so mock synthesis with valid audible audio.
+        from unittest.mock import patch
+
+        async def mock_generate_dubbed(segments, output_audio_path, **kwargs):
+            output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", "sine=frequency=600:duration=1.6",
+                "-c:a", "libmp3lame",
+                str(output_audio_path),
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return output_audio_path
+
+        with patch("app.main.generate_dubbed_audio_track", side_effect=mock_generate_dubbed):
+            res = client.post(
+                f"/api/jobs/{job_id}/export-video",
+                json={
+                    "subtitle_source": "translation",
+                    "font_size": 20,
+                    "burn_subtitles": True,
+                    "include_dubbed_audio": True,
+                    "audio_mode": "dubbed",
+                },
+            )
         assert res.status_code == 200, res.text
         data = res.json()
         assert data.get("has_rendered_video") is True
