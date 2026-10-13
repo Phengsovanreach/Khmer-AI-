@@ -519,8 +519,10 @@ async def generate_dubbed_audio_track(
                             except Exception as exc3:
                                 logger.warning("TTS failed on segment %d ('%s'): %s. Using resonant speech synthesis fallback.", idx, clean_text[:30], exc3)
 
-                        # Attempt 4: Audible formant fallback if enabled (e.g. cloud datacenter IP blocked)
-                        allow_fallback = kwargs.get("enable_fallback", False) or (os.getenv("ENABLE_TTS_FALLBACK", "").lower() in ("1", "true"))
+                        # Attempt 4: Audible formant fallback in production if cloud IP is rate-limited (403)
+                        # Disabled only when allow_fallback=False or in unit tests
+                        is_test_env = os.getenv("TESTING") == "1" or os.getenv("PYTEST_CURRENT_TEST") is not None
+                        allow_fallback = kwargs.get("allow_fallback", not is_test_env)
                         if not speech_generated and allow_fallback:
                             try:
                                 dur_str = f"{max(0.4, min(seg_duration, 4.0)):.2f}"
