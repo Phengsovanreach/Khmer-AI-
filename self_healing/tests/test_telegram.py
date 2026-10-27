@@ -12,7 +12,9 @@ from self_healing.notifications.formatter import format_telegram_alert
 from self_healing.notifications.telegram import TelegramNotifier
 
 
-def test_telegram_unconfigured():
+def test_telegram_unconfigured(monkeypatch):
+    monkeypatch.setattr(Config, "TELEGRAM_BOT_TOKEN", None)
+    monkeypatch.setattr(Config, "TELEGRAM_CHAT_ID", None)
     notifier = TelegramNotifier(token=None, chat_id=None)
     assert notifier.is_configured is False
     res = notifier.send_message("Test message")

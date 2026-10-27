@@ -19,7 +19,7 @@ if _ENV_FILE.exists():
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip("'\"")
-                if k and k not in os.environ:
+                if k and v:
                     os.environ[k] = v
     except Exception:
         pass
@@ -55,7 +55,7 @@ class Config:
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "auto").lower()  # auto, gemini, openai, mock, none
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
-    AI_MODEL_NAME: str = os.getenv("AI_MODEL_NAME", "gemini-1.5-flash")
+    AI_MODEL_NAME: str = os.getenv("AI_MODEL_NAME", "gemini-3.5-flash-lite")
 
     # Storage Paths
     BASE_DIR: Path = Path(__file__).resolve().parent.parent

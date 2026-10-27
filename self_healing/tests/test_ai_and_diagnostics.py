@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from self_healing.ai.analyzer import FailureAnalyzer
 from self_healing.ai.gemini_provider import GeminiProvider
+from self_healing.config import Config
 from self_healing.diagnostics.collector import DiagnosticCollector
 from self_healing.models import CheckResult, Incident, IncidentStatus, ServiceType
 
@@ -38,7 +39,9 @@ def test_diagnostics_collector():
     assert "[REDACTED_CREDENTIAL]" in evidence["raw_error"]
 
 
-def test_ai_analyzer_unconfigured():
+def test_ai_analyzer_unconfigured(monkeypatch):
+    monkeypatch.setattr(Config, "GEMINI_API_KEY", None)
+    monkeypatch.setattr(Config, "OPENAI_API_KEY", None)
     analyzer = FailureAnalyzer(provider=None)
     inc = Incident(
         incident_id="INC-BE-999",
