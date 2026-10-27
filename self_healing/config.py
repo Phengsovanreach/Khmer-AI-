@@ -73,7 +73,9 @@ class Config:
     )
 
 
-# Regex patterns for redacting sensitive secrets from logs and reports
+# Regex patterns for redacting sensitive secrets and non-permitted Thai characters
+_THAI_CHAR_PATTERN = re.compile(r"[\u0E00-\u0E7F]+")
+
 _REDACT_PATTERNS = [
     re.compile(r"\b\d{9,10}:[a-zA-Z0-9_-]{35}\b"),              # Telegram bot tokens
     re.compile(r"ghp_[a-zA-Z0-9]{36,255}"),                      # GitHub classic PATs
@@ -85,11 +87,18 @@ _REDACT_PATTERNS = [
 ]
 
 
-def redact_secrets(text: str) -> str:
-    """Scrubs all known credentials, tokens, and authorization headers from text."""
+def strip_thai_characters(text: str) -> str:
+    """Strictly removes any Thai Unicode characters from text."""
     if not text:
         return text
-    scrubbed = text
+    return _THAI_CHAR_PATTERN.sub("", text)
+
+
+def redact_secrets(text: str) -> str:
+    """Scrubs all credentials and strictly removes any Thai script from text."""
+    if not text:
+        return text
+    scrubbed = strip_thai_characters(text)
     for pattern in _REDACT_PATTERNS:
         scrubbed = pattern.sub("[REDACTED_CREDENTIAL]", scrubbed)
     # Also explicitly redact configured tokens if present in memory

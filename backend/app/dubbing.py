@@ -201,8 +201,6 @@ async def generate_speech_sample(
             sample_text = "Bonjour et bienvenue dans le studio de doublage IA."
         elif "es-" in vid_lower:
             sample_text = "Hola, bienvenido al estudio de traducción y doblaje de video."
-        elif "th-" in vid_lower:
-            sample_text = "สวัสดีครับ ยินดีต้อนรับสู่ระบบแปลและพากย์เสียงวิดีโอ"
         elif "vi-" in vid_lower:
             sample_text = "Xin chào, chào mừng bạn đến với studio lồng tiếng video."
         else:

@@ -12,7 +12,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from ..config import Config, redact_secrets
+from ..config import Config, redact_secrets, strip_thai_characters
 from .gemini_provider import GeminiProvider
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,7 @@ class HourlyAIInspector:
 
         prompt = (
             "You are the Lead AI Site Reliability Engineer for Khmer Translator AI fullstack platform.\n"
+            "CRITICAL RESTRICTION: Do NOT include ANY Thai script, Thai characters, or Thai words anywhere. Use ONLY pure Khmer (ភាសាខ្មែរ) and English.\n"
             "Analyze this hourly runtime telemetry snapshot and return ONLY valid JSON matching this schema:\n"
             "{\n"
             '  "health_score": 98,\n'
@@ -114,7 +115,11 @@ class HourlyAIInspector:
             try:
                 result = self.provider.generate_analysis(prompt)
                 if isinstance(result, dict) and "health_score" in result:
-                    return result
+                    # Sanitize any accidental Thai characters from AI response
+                    sanitized = {}
+                    for k, v in result.items():
+                        sanitized[k] = strip_thai_characters(v) if isinstance(v, str) else v
+                    return sanitized
             except Exception as exc:
                 logger.warning("Gemini hourly analysis failed, using heuristic: %s", exc)
 
