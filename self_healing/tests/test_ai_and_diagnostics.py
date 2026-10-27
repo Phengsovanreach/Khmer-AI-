@@ -114,3 +114,44 @@ def test_gemini_provider_mock_success():
         assert res is not None
         assert res["failure_category"] == "DATABASE_LOCK"
         assert res["confidence"] == 0.9
+
+
+def test_hourly_inspector_and_formatter():
+    from self_healing.ai.hourly_inspector import HourlyAIInspector
+    from self_healing.notifications import format_hourly_ai_report
+
+    mock_provider = MagicMock()
+    mock_provider.is_available.return_value = True
+    mock_provider.generate_analysis.return_value = {
+        "health_score": 98,
+        "performance_status_kh": "ល្អប្រសើរ",
+        "performance_status_en": "Optimal",
+        "whisper_status": "Operational",
+        "tts_status": "Operational",
+        "ai_opinion_kh": "ប្រព័ន្ធដំណើរការបានល្អឥតខ្ចោះ",
+        "ai_opinion_en": "All translation pipelines functional",
+        "recommendation_kh": "គ្មានបញ្ហា",
+    }
+
+    inspector = HourlyAIInspector(provider=mock_provider)
+    telemetry = {
+        "capabilities": {
+            "faster_whisper": True,
+            "default_model": "tiny",
+            "available_models": ["tiny", "base"],
+            "tts": True,
+            "supported_languages_count": 20,
+        },
+        "voices": [{"name": "Piseth Neural"}],
+    }
+
+    insights = inspector.analyze_with_ai(telemetry, fe_latency_ms=120.0, be_latency_ms=300.0)
+    assert insights["health_score"] == 98
+    assert "ល្អប្រសើរ" in insights["performance_status_kh"]
+
+    msg = format_hourly_ai_report(telemetry, insights, fe_latency_ms=120.0, be_latency_ms=300.0)
+    assert "HOURLY AI INSPECTION" in msg
+    assert "98/100" in msg
+    assert "Piseth Neural" in msg
+    assert "120.0 ms" in msg
+    assert "300.0 ms" in msg

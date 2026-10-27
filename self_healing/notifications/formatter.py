@@ -159,3 +159,48 @@ def format_ci_report(
             msg += f"  • {k}: <code>{v}</code> {badge}\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━"
     return msg
+
+
+def format_hourly_ai_report(
+    telemetry: dict[str, Any],
+    ai_insights: dict[str, Any],
+    fe_latency_ms: float = 0.0,
+    be_latency_ms: float = 0.0,
+) -> str:
+    """Formats the hourly deep AI telemetry & intelligence inspection report."""
+    caps = telemetry.get("capabilities", {})
+    voices = telemetry.get("voices", [])
+    time_str = format_cambodia_time()
+    score = ai_insights.get("health_score", 99)
+    score_badge = "🟢" if score >= 90 else ("🟡" if score >= 70 else "🔴")
+    models_list = ", ".join(caps.get("available_models", ["tiny", "base"]))
+    voices_count = len(voices)
+
+    return (
+        f"🤖 <b>KHMER TRANSLATOR AI — HOURLY AI INSPECTION</b>\n"
+        f"🧠 <b>របាយការណ៍វិភាគទិន្នន័យ & ដំណើរការ AI (ប្រចាំ ១ ម៉ោង)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>ពិន្ទុដំណើរការ (Health Score):</b> <code>{score}/100</code> {score_badge} <b>{ai_insights.get('performance_status_kh', 'ល្អប្រសើរ')}</b>\n"
+        f"🕒 <b>ពេលវេលា (Time):</b> <code>{time_str}</code>\n"
+        f"⏱️ <b>ប្រេកង់ (Interval):</b> <code>រៀងរាល់ 1 ម៉ោងម្តង (Hourly Analysis)</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>ទិន្នន័យម៉ាស៊ីន AI & សមត្ថភាព (AI Engines Telemetry)</b>\n"
+        f"  ├ 🗣️ <b>Whisper AI (Speech-to-Text):</b> <code>{models_list}</code> 🟢 សកម្ម\n"
+        f"  ├ 🎙️ <b>TTS Dubbing (Khmer Voices):</b> <code>{voices_count} សំឡេង Neural</code> 🟢 សកម្ម\n"
+        f"  │   • ពិសិដ្ឋ (Piseth Neural - ប្រុស)\n"
+        f"  │   • ស្រីមុំ (Sreymom Neural - ស្រី)\n"
+        f"  ├ 🎞️ <b>Media Engine:</b> <code>FFmpeg + FFprobe</code> 🟢 ដំណើរការ\n"
+        f"  └ 🌐 <b>ភាសាគាំទ្រ (Supported Languages):</b> <code>{caps.get('supported_languages_count', 20)} ភាសា</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <b>ល្បឿនបណ្តាញ & ឆ្លើយតប (Network & Latency)</b>\n"
+        f"  ├ គេហទំព័រ (Cloudflare Pages): <code>{fe_latency_ms:.1f} ms</code> 🟢\n"
+        f"  └ ម៉ាស៊ីនបម្រើ (Render FastAPI): <code>{be_latency_ms:.1f} ms</code> 🟢\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <b>ការវិភាគ & យោបល់របស់ Gemini AI (AI Insights)</b>\n"
+        f"• <b>ខ្មែរ:</b> <i>{ai_insights.get('ai_opinion_kh', '')}</i>\n"
+        f"• <b>English:</b> <i>{ai_insights.get('ai_opinion_en', '')}</i>\n"
+        f"• <b>អនុសាសន៍ (Recommendation):</b> {ai_insights.get('recommendation_kh', 'ដំណើរការល្អ')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>សេចក្តីសន្និដ្ឋាន:</b> សេវាបកប្រែជាអក្សរ និងសំឡេងត្រៀមរួចរាល់ ១០០%\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+    )

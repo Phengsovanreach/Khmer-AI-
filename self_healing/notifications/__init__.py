@@ -7,6 +7,7 @@ from .formatter import (
     format_recovery_alert,
     format_heartbeat_report,
     format_ci_report,
+    format_hourly_ai_report,
 )
 
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "format_recovery_alert",
     "format_heartbeat_report",
     "format_ci_report",
+    "format_hourly_ai_report",
 ]

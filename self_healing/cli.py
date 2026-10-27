@@ -11,6 +11,7 @@ import sys
 from typing import Optional
 
 from .ai import FailureAnalyzer
+from .ai.hourly_inspector import HourlyAIInspector
 from .config import Config, redact_secrets
 from .diagnostics import DiagnosticCollector
 from .models import EventCategory, IncidentStatus, Severity
@@ -19,6 +20,7 @@ from .notifications import (
     TelegramNotifier,
     format_ci_report,
     format_heartbeat_report,
+    format_hourly_ai_report,
     format_recovery_alert,
     format_telegram_alert,
 )
@@ -32,11 +34,39 @@ logging.basicConfig(
 logger = logging.getLogger("self_healing.cli")
 
 
-def run_health_checks(notify_always: Optional[bool] = None) -> int:
+def run_hourly_ai_report(fe_latency_ms: float = 0.0, be_latency_ms: float = 0.0) -> dict[str, Any]:
+    """
+    Executes deep telemetry inspection of live backend capabilities and dubbing models,
+    generates structured insights using Gemini AI, and dispatches an hourly report to Telegram.
+    """
+    notifier = TelegramNotifier()
+    inspector = HourlyAIInspector()
+
+    logger.info("Gathering live telemetry from backend engines...")
+    telemetry = inspector.collect_live_telemetry()
+
+    logger.info("Querying Gemini AI for hourly intelligence assessment...")
+    ai_insights = inspector.analyze_with_ai(telemetry, fe_latency_ms=fe_latency_ms, be_latency_ms=be_latency_ms)
+
+    report_msg = format_hourly_ai_report(
+        telemetry=telemetry,
+        ai_insights=ai_insights,
+        fe_latency_ms=fe_latency_ms,
+        be_latency_ms=be_latency_ms,
+    )
+
+    logger.info("Dispatching Hourly AI Intelligence Report to Telegram...")
+    res = notifier.send_message(report_msg)
+    return res
+
+
+def run_health_checks(notify_always: Optional[bool] = None, force_hourly: bool = False) -> int:
     """
     Executes full cloud synthetic health checks against frontend and backend.
     Updates incident state, triggers Telegram alerts, and initiates diagnosis on confirmed outages.
-    If notify_always is True (or Config.ALWAYS_NOTIFY is True), also sends a healthy heartbeat notification.
+    If notify_always is True (or Config.ALWAYS_NOTIFY is True):
+      - Dispatches Type 2 (Hourly AI Inspection Report) if 1 hour has elapsed (or force_hourly=True).
+      - Dispatches Type 1 (Routine Health Heartbeat Report) for routine interim checks.
     Returns: 0 if all services healthy/recovering, 1 if confirmed failure detected.
     """
     tracker = IncidentTracker()
@@ -96,12 +126,20 @@ def run_health_checks(notify_always: Optional[bool] = None) -> int:
             rec_msg = format_recovery_alert(incident)
             notifier.send_message(rec_msg)
 
-    # If all services are healthy and ALWAYS_NOTIFY is requested, dispatch healthy heartbeat report
+    # If all services are healthy and notification is requested:
     if not has_alert_dispatched and should_always_notify:
         active_count = len(tracker._state.get("active_incidents", {}))
-        heartbeat_msg = format_heartbeat_report(fe_res, be_res, active_count=active_count)
-        logger.info("Dispatching routine healthy heartbeat report to Telegram...")
-        notifier.send_message(heartbeat_msg)
+
+        # Check if 1 hour has elapsed or if explicitly requested to send hourly AI inspection
+        if force_hourly or tracker.should_run_hourly_report():
+            logger.info("Hourly window reached (every 1 hour). Dispatching Hourly AI Inspection Report...")
+            run_hourly_ai_report(fe_latency_ms=fe_res.latency_ms, be_latency_ms=be_res.latency_ms)
+            tracker.record_hourly_report_run()
+        else:
+            # Routine 30-min heartbeat report
+            heartbeat_msg = format_heartbeat_report(fe_res, be_res, active_count=active_count)
+            logger.info("Dispatching routine healthy heartbeat report to Telegram...")
+            notifier.send_message(heartbeat_msg)
 
     return 1 if has_confirmed_failure else 0
 
@@ -152,7 +190,9 @@ def main() -> None:
 
     check_parser = subparsers.add_parser("check", help="Run health probes and process state machine")
     check_parser.add_argument("--always-notify", action="store_true", help="Send Telegram status report even if all services are healthy")
+    check_parser.add_argument("--hourly", action="store_true", help="Force dispatch of the Hourly AI Deep Telemetry Report")
 
+    subparsers.add_parser("hourly-ai-report", help="Force immediate generation and dispatch of Hourly AI Inspection Report")
     status_parser = subparsers.add_parser("status", help="Print active incidents and health status")
     test_notify_parser = subparsers.add_parser("test-notify", help="Test Telegram alert formatting")
 
@@ -167,8 +207,15 @@ def main() -> None:
 
     if args.command in (None, "check"):
         always_flag = getattr(args, "always_notify", False)
-        exit_code = run_health_checks(notify_always=always_flag if always_flag else None)
+        hourly_flag = getattr(args, "hourly", False)
+        exit_code = run_health_checks(
+            notify_always=always_flag if always_flag else None,
+            force_hourly=hourly_flag,
+        )
         sys.exit(exit_code)
+    elif args.command == "hourly-ai-report":
+        res = run_hourly_ai_report()
+        print(f"Hourly AI Report Result: {res}")
     elif args.command == "status":
         print_status()
     elif args.command == "ci-notify":

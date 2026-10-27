@@ -156,3 +156,20 @@ class IncidentTracker:
                 incident.repair_attempts = extra["repair_attempts"]
         self._state.setdefault("active_incidents", {})[incident.service.value] = incident.to_dict()
         self.save()
+
+    def should_run_hourly_report(self, interval_seconds: int = 3600) -> bool:
+        """Determines if 1 hour has elapsed since the last hourly AI inspection report."""
+        last_str = self._state.get("last_hourly_ai_report_utc")
+        if not last_str:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last_str)
+            now_dt = datetime.now(timezone.utc)
+            return (now_dt - last_dt).total_seconds() >= interval_seconds
+        except Exception:
+            return True
+
+    def record_hourly_report_run(self) -> None:
+        """Records the timestamp of the hourly AI inspection report."""
+        self._state["last_hourly_ai_report_utc"] = datetime.now(timezone.utc).isoformat()
+        self.save()
