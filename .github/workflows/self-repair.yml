@@ -45,7 +45,9 @@ jobs:
 
       - name: Install FFmpeg & Test Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+          fi
           python -m pip install --upgrade pip
           pip install pytest pytest-mock -r backend/requirements.txt
           cd frontend && npm ci

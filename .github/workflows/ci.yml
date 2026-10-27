@@ -25,10 +25,13 @@ jobs:
           cache: "pip"
           cache-dependency-path: backend/requirements.txt
 
-      - name: Install FFmpeg
+      - name: Verify FFmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version
 
       - name: Install Backend Dependencies
         run: |
