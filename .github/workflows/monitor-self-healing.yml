@@ -52,8 +52,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALWAYS_NOTIFY: "true"
         run: |
-          python -m self_healing.cli check
+          python -m self_healing.cli check --always-notify
 
       - name: Save Incident State Artifact
         if: always()

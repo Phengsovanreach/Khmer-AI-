@@ -93,3 +93,36 @@ jobs:
       - name: Run Self-Healing Test Suite
         run: |
           pytest self_healing/tests/ -v
+
+  ci-notify:
+    name: Telegram Pipeline Notification
+    needs: [backend-tests, frontend-build, self-healing-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dispatch Telegram CI Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATUS="SUCCESS"
+          if [ "${{ needs.backend-tests.result }}" != "success" ] || \
+             [ "${{ needs.frontend-build.result }}" != "success" ] || \
+             [ "${{ needs.self-healing-tests.result }}" != "success" ]; then
+            STATUS="FAILURE"
+          fi
+
+          python -m self_healing.cli ci-notify \
+            --status "$STATUS" \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --message "${{ github.event.head_commit.message }}" \
+            --details '{"Backend Unit Tests": "${{ needs.backend-tests.result }}", "Frontend Build": "${{ needs.frontend-build.result }}", "Self-Healing Tests": "${{ needs.self-healing-tests.result }}"}'

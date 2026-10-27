@@ -49,6 +49,7 @@ class Config:
     TELEGRAM_BOT_TOKEN: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
     TELEGRAM_API_BASE: str = "https://api.telegram.org"
+    ALWAYS_NOTIFY: bool = os.getenv("ALWAYS_NOTIFY", "false").lower() in ("true", "1", "yes")
 
     # AI Provider Settings
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "auto").lower()  # auto, gemini, openai, mock, none

@@ -15,7 +15,13 @@ from .config import Config, redact_secrets
 from .diagnostics import DiagnosticCollector
 from .models import EventCategory, IncidentStatus, Severity
 from .monitors import check_backend_health, check_frontend_health
-from .notifications import TelegramNotifier, format_recovery_alert, format_telegram_alert
+from .notifications import (
+    TelegramNotifier,
+    format_ci_report,
+    format_heartbeat_report,
+    format_recovery_alert,
+    format_telegram_alert,
+)
 from .repair import PullRequestCreator, RepairWorker
 from .state import IncidentTracker
 
@@ -26,15 +32,18 @@ logging.basicConfig(
 logger = logging.getLogger("self_healing.cli")
 
 
-def run_health_checks(auto_diagnose: bool = True) -> int:
+def run_health_checks(notify_always: Optional[bool] = None) -> int:
     """
     Executes full cloud synthetic health checks against frontend and backend.
     Updates incident state, triggers Telegram alerts, and initiates diagnosis on confirmed outages.
+    If notify_always is True (or Config.ALWAYS_NOTIFY is True), also sends a healthy heartbeat notification.
     Returns: 0 if all services healthy/recovering, 1 if confirmed failure detected.
     """
     tracker = IncidentTracker()
     notifier = TelegramNotifier()
     analyzer = FailureAnalyzer()
+
+    should_always_notify = Config.ALWAYS_NOTIFY if notify_always is None else notify_always
 
     logger.info("Executing cloud synthetic probes...")
     logger.info("Target Frontend: %s", Config.FRONTEND_URL)
@@ -49,6 +58,7 @@ def run_health_checks(auto_diagnose: bool = True) -> int:
     logger.info("Backend Check:  %s (Status: %s, Latency: %.1fms)", "OK" if be_res.is_healthy else "FAIL", be_res.status_code, be_res.latency_ms)
 
     has_confirmed_failure = False
+    has_alert_dispatched = False
 
     # Process results through state tracker
     for res in (fe_res, be_res):
@@ -56,6 +66,7 @@ def run_health_checks(auto_diagnose: bool = True) -> int:
 
         if notify_event == "CONFIRMED_FAILURE" and incident:
             has_confirmed_failure = True
+            has_alert_dispatched = True
             logger.warning("CONFIRMED OUTAGE: Incident %s on %s", incident.incident_id, incident.service.value)
 
             # Collect diagnostic evidence
@@ -80,9 +91,17 @@ def run_health_checks(auto_diagnose: bool = True) -> int:
             notifier.send_message(alert_msg)
 
         elif notify_event == "RECOVERED" and incident:
+            has_alert_dispatched = True
             logger.info("SERVICE RECOVERED: Incident %s on %s resolved", incident.incident_id, incident.service.value)
             rec_msg = format_recovery_alert(incident)
             notifier.send_message(rec_msg)
+
+    # If all services are healthy and ALWAYS_NOTIFY is requested, dispatch healthy heartbeat report
+    if not has_alert_dispatched and should_always_notify:
+        active_count = len(tracker._state.get("active_incidents", {}))
+        heartbeat_msg = format_heartbeat_report(fe_res, be_res, active_count=active_count)
+        logger.info("Dispatching routine healthy heartbeat report to Telegram...")
+        notifier.send_message(heartbeat_msg)
 
     return 1 if has_confirmed_failure else 0
 
@@ -106,21 +125,60 @@ def print_status() -> None:
     print("=================================================\n")
 
 
+def send_ci_notification(status: str, branch: str, commit_sha: str, commit_msg: str, details_json: Optional[str] = None) -> None:
+    """Sends CI test pipeline status report to Telegram."""
+    notifier = TelegramNotifier()
+    details = {}
+    if details_json:
+        try:
+            details = json.loads(details_json)
+        except Exception:
+            pass
+
+    msg = format_ci_report(
+        status=status,
+        branch=branch,
+        commit_sha=commit_sha,
+        commit_msg=commit_msg,
+        details=details if details else None,
+    )
+    res = notifier.send_message(msg)
+    logger.info("CI Notification dispatched: %s", res)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Khmer Translator AI Self-Healing System CLI")
     subparsers = parser.add_subparsers(dest="command")
 
     check_parser = subparsers.add_parser("check", help="Run health probes and process state machine")
+    check_parser.add_argument("--always-notify", action="store_true", help="Send Telegram status report even if all services are healthy")
+
     status_parser = subparsers.add_parser("status", help="Print active incidents and health status")
     test_notify_parser = subparsers.add_parser("test-notify", help="Test Telegram alert formatting")
+
+    ci_parser = subparsers.add_parser("ci-notify", help="Send CI pipeline execution notification")
+    ci_parser.add_argument("--status", required=True, choices=["SUCCESS", "FAILURE"], help="CI build status")
+    ci_parser.add_argument("--branch", required=True, help="Git branch name")
+    ci_parser.add_argument("--commit", required=True, help="Commit SHA")
+    ci_parser.add_argument("--message", default="", help="Commit message")
+    ci_parser.add_argument("--details", default="", help="JSON string with details")
 
     args = parser.parse_args()
 
     if args.command in (None, "check"):
-        exit_code = run_health_checks()
+        always_flag = getattr(args, "always_notify", False)
+        exit_code = run_health_checks(notify_always=always_flag if always_flag else None)
         sys.exit(exit_code)
     elif args.command == "status":
         print_status()
+    elif args.command == "ci-notify":
+        send_ci_notification(
+            status=args.status,
+            branch=args.branch,
+            commit_sha=args.commit,
+            commit_msg=args.message,
+            details_json=args.details,
+        )
     elif args.command == "test-notify":
         notifier = TelegramNotifier()
         sample_msg = format_telegram_alert(
