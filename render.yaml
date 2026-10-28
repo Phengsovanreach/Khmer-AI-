@@ -3,7 +3,7 @@ services:
     name: khmer-translator-backend
     runtime: docker
     dockerfilePath: Dockerfile
-    plan: standard
+    plan: free
     healthCheckPath: /api/ready
     envVars:
       - key: PYTHONUNBUFFERED
