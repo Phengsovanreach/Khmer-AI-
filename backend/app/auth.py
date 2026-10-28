@@ -78,6 +78,7 @@ def init_auth_db(db_path: Any = None) -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)")
+        conn.commit()
     conn.close()
 
     # Rebind SQLAlchemy to target SQLite database
@@ -115,11 +116,6 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _FAILED_LOGIN_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_WINDOW_SECONDS = 300.0  # 5 minutes
-
-
-def init_auth_db(db_file: Path | str | None = None) -> None:
-    """Initialize database tables via SQLAlchemy metadata."""
-    init_db()
 
 
 # Initialize database at module load
