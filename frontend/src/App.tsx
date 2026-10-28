@@ -1240,10 +1240,10 @@ export default function App() {
     activeJobIdRef.current = active?.id || null;
   }, [active?.id]);
 
-  // Load backend state
-  const loadState = async () => {
+  // Load backend state with resilient cold-start detection and non-collapsing settled calls
+  const loadState = async (retryCount = 0) => {
     try {
-      const [resJobs, resCaps, resModels, resVoices, resSettings, resLangs] = await Promise.all([
+      const results = await Promise.allSettled([
         authFetch(`${API}/api/jobs`),
         authFetch(`${API}/api/capabilities`),
         authFetch(`${API}/api/transcription/models`),
@@ -1252,7 +1252,21 @@ export default function App() {
         authFetch(`${API}/api/languages`),
       ]);
 
-      if (resJobs.ok) {
+      const [resJobs, resCaps, resModels, resVoices, resSettings, resLangs] = results.map((r) =>
+        r.status === 'fulfilled' ? r.value : null
+      );
+
+      // Detect potential Render Free Tier cold-start (all initial calls rejected or non-200)
+      const allFailed = results.every((r) => r.status === 'rejected' || (r.status === 'fulfilled' && !r.value?.ok));
+      if (allFailed && retryCount < 3) {
+        setNotice('🔄 ម៉ាស៊ីនបម្រើ Cloud Backend កំពុងចាប់ផ្ដើមដំណើរការឡើងវិញ (Server is waking up)... សូមរង់ចាំបន្តិច');
+        setTimeout(() => {
+          void loadState(retryCount + 1);
+        }, 2500);
+        return;
+      }
+
+      if (resJobs && resJobs.ok) {
         const jobsData: Job[] = await resJobs.json();
         setJobs(jobsData);
         const currentTargetId = activeJobIdRef.current;
@@ -1266,29 +1280,33 @@ export default function App() {
           setActive(jobsData[0]);
         }
       }
-      if (resCaps.ok) {
+      if (resCaps && resCaps.ok) {
         const capsData = await resCaps.json();
         setCaps(capsData);
         if (capsData.default_model) setSelectedModel(capsData.default_model);
       }
-      if (resModels.ok) {
+      if (resModels && resModels.ok) {
         const modelsData = await resModels.json();
         setModels(modelsData.models || []);
       }
-      if (resVoices.ok) {
+      if (resVoices && resVoices.ok) {
         const voicesData = await resVoices.json();
         setVoices(voicesData || []);
       }
-      if (resSettings.ok) {
+      if (resSettings && resSettings.ok) {
         const settingsData = await resSettings.json();
         setAppSettings(settingsData);
       }
-      if (resLangs.ok) {
+      if (resLangs && resLangs.ok) {
         const langsData = await resLangs.json();
         setLanguagesData(langsData);
       }
     } catch {
-      setError('មិនអាចភ្ជាប់ទៅកាន់ FastAPI Backend បានទេ។ សូមពិនិត្យថាតើ Backend កំពុងដំណើរការនៅ port 8000 ដែរឬទេ។');
+      const isLocal = API.includes('localhost') || API.includes('127.0.0.1');
+      const msg = isLocal
+        ? 'មិនអាចភ្ជាប់ទៅកាន់ FastAPI Backend (Local) បានទេ។ សូមពិនិត្យថាតើ Backend កំពុងដំណើរការនៅ port 8000 ដែរឬទេ។'
+        : 'មិនអាចភ្ជាប់ទៅកាន់ម៉ាស៊ីនបម្រើ Cloud Backend បានទេ។ ម៉ាស៊ីនបម្រើអាចនឹងកំពុងចាប់ផ្ដើមដំណើរការឡើងវិញ (Cold Start) សូមព្យាយាមម្ដងទៀត។';
+      setError(msg);
     }
   };
 
@@ -1483,11 +1501,14 @@ export default function App() {
             try {
               const res = await authFetch(`${API}/api/jobs/${currentJobId}`);
               if (res.status === 404) {
-                if (pollInterval) clearInterval(pollInterval);
+                if (pollInterval) {
+                  clearInterval(pollInterval);
+                  pollInterval = null;
+                }
                 if (isMounted) {
                   setActive((prev) => (prev?.id === currentJobId ? null : prev));
+                  setNotice('គម្រោងពីមុនផុតកំណត់ ឬមិនមាននៅលើម៉ាស៊ីនបម្រើទៀតទេ (Job expired or not found)');
                 }
-                void loadState();
                 return;
               }
               if (res.ok) {
@@ -1702,7 +1723,12 @@ export default function App() {
       uploadControllerRef.current = null;
       await loadState();
 
-      await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, false);
+      try {
+        await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, false);
+      } catch (transcribeErr: any) {
+        // Preserve uploaded job so the user never has to re-upload the file
+        setError(`ការ Upload វីដេអូបានជោគជ័យ ១០០% ប៉ុន្តែការស្គាល់សំឡេងមានបញ្ហា: ${transcribeErr.message || transcribeErr}។ ឯកសារត្រូវបានរក្សាទុកនៅលើ Server រួចហើយ អ្នកអាចចុចប៊ូតុង "សាកល្បងម្ដងទៀត" ដោយមិនបាច់ Upload ឡើងវិញទេ។`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'ដំណើរការបរាជ័យ');
     } finally {
@@ -1787,7 +1813,12 @@ export default function App() {
         uploadControllerRef.current = null;
         await loadState();
 
-        await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, true);
+        try {
+          await runTranscription(uploadedJob.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, true);
+        } catch (transcribeErr: any) {
+          // Preserve uploaded job so the user never has to re-upload the file
+          setError(`ការ Upload វីដេអូបានជោគជ័យ ១០០% ប៉ុន្តែការបកប្រែ/បញ្ចូលសំឡេងមានបញ្ហា: ${transcribeErr.message || transcribeErr}។ ឯកសារត្រូវបានរក្សាទុកនៅលើ Server រួចហើយ អ្នកអាចចុចប៊ូតុង "សាកល្បងម្ដងទៀត" ដោយមិនបាច់ Upload ឡើងវិញទេ។`);
+        }
       } catch (err: any) {
         setError(err instanceof Error ? err.message : 'Upload failed');
       } finally {
@@ -2734,8 +2765,41 @@ export default function App() {
                               <small>MP4, MKV, MOV, WEBM, MP3, WAV, M4A, FLAC, OGG · Resumable Chunked Upload · Max 4 GB</small>
                             </motion.button>
 
-                            {/* Selected File Details */}
+                            {/* Selected File Details & Uploaded Job Recovery Card */}
                             <AnimatePresence>
+                              {!selectedFile && active && (active.status === 'failed' || active.status === 'uploaded' || !active.transcript?.length) && (
+                                <motion.div
+                                  initial={{ opacity: 0, y: 6 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, y: -6 }}
+                                  className="file-preview"
+                                  style={{ borderColor: 'var(--accent)', background: 'rgba(235, 94, 40, 0.06)', marginTop: 12 }}
+                                >
+                                  <div className="file-preview-icon">
+                                    <FileVideo size={20} color="var(--accent)" />
+                                  </div>
+                                  <div className="file-preview-info">
+                                    <b>{active.filename || active.name || active.id}</b>
+                                    <small style={{ color: active.status === 'failed' ? '#e03131' : 'var(--muted)' }}>
+                                      {active.status === 'failed'
+                                        ? '⚠️ ការដំណើរការមិនទាន់ជោគជ័យ (ឯកសារបានរក្សាទុកលើ Server រួចហើយ)'
+                                        : '✅ វីដេអូបាន Upload ជោគជ័យ (រួចរាល់សម្រាប់ដំណើរការ)'}
+                                    </small>
+                                  </div>
+                                  <div className="file-preview-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+                                    <button
+                                      type="button"
+                                      className="primary-btn"
+                                      style={{ padding: '6px 14px', fontSize: 12, borderRadius: 6 }}
+                                      disabled={busy}
+                                      onClick={() => runTranscription(active.id, selectedModel, selectedSourceLang, selectedTargetLang, true, true, false)}
+                                    >
+                                      <WandSparkles size={14} /> 🔄 សាកល្បងម្ដងទៀត (Retry)
+                                    </button>
+                                  </div>
+                                </motion.div>
+                              )}
+
                               {selectedFile && (
                                 <motion.div
                                   initial={{ opacity: 0, y: 6 }}
