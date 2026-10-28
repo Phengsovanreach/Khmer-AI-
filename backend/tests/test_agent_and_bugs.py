@@ -14,11 +14,17 @@ from app.db.database import db_session_scope, set_db_url
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path):
+def isolated_db(tmp_path, monkeypatch):
     db_file = tmp_path / "test_agent_bugs.db"
     set_db_url(f"sqlite:///{db_file.as_posix()}")
-    from app.auth import init_auth_db
-    init_auth_db(str(db_file))
+    from app.db.database import init_db
+    init_db()
+
+    # Mock Telegram & network delivery so unit tests are instantaneous
+    import self_healing.notifications.telegram as tg_mod
+    monkeypatch.setattr(tg_mod.TelegramNotifier, "send_message", lambda self, *args, **kwargs: {"status": "DELIVERED", "delivered": True})
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: None)
     yield
 
 

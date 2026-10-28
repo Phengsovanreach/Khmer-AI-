@@ -146,17 +146,17 @@ def report_bug(req: BugReportRequest, request: Request):
 
             notifier = TelegramNotifier()
             if notifier.is_configured:
-                err_block = f"\n<b>Error Log:</b>\n<code>{clean_error[:350]}</code>" if clean_error else ""
+                err_block = f"\n<b>សារកំហុស (Error Log):</b>\n<code>{clean_error[:350]}</code>" if clean_error else ""
                 msg = (
-                    f"🐞 <b>KHMER TRANSLATOR AI — USER BUG REPORT</b>\n"
+                    f"🐞 <b>KHMER TRANSLATOR AI — របាយការណ៍បញ្ហាពីអ្នកប្រើប្រាស់ (USER BUG REPORT)</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Incident ID:</b> <code>{incident_id}</code>\n"
-                    f"<b>Severity:</b> {req.severity.upper()}\n"
-                    f"<b>Page:</b> {clean_url}\n"
-                    f"<b>Description:</b>\n"
+                    f"<b>លេខសម្គាល់បញ្ហា (Incident ID):</b> <code>{incident_id}</code>\n"
+                    f"<b>កម្រិតធ្ងន់ធ្ងរ (Severity):</b> {req.severity.upper()}\n"
+                    f"<b>ទំព័រជួបបញ្ហា (Page):</b> {clean_url}\n"
+                    f"<b>ការពិពណ៌នាអំពីបញ្ហា (Description):</b>\n"
                     f"<i>{clean_desc}</i>{err_block}\n\n"
-                    f"<b>Status:</b> 🟡 RECEIVED (Queued for Autonomous Analysis)\n"
-                    f"<b>Time:</b> <code>{format_cambodia_time()}</code>\n"
+                    f"<b>ស្ថានភាព (Status):</b> 🟡 បានទទួល (RECEIVED — រង់ចាំការវិភាគស្វ័យប្រវត្តិ)\n"
+                    f"<b>ពេលវេលា (Time):</b> <code>{format_cambodia_time()}</code>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━"
                 )
                 notifier.send_message(msg)
