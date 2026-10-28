@@ -66,7 +66,9 @@ def set_db_url(new_url: str) -> None:
     IS_SQLITE = DATABASE_URL.startswith("sqlite")
     kwargs: dict[str, Any] = {"pool_pre_ping": True}
     if IS_SQLITE:
-        kwargs["connect_args"] = {"check_same_thread": False}
+        from sqlalchemy.pool import NullPool
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+        kwargs["poolclass"] = NullPool
     elif IS_POSTGRES:
         kwargs.update({
             "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
