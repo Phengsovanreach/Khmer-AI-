@@ -1,6 +1,16 @@
 from __future__ import annotations
 from typing import Any
-from pydantic import BaseModel, Field
+try:
+    from pydantic import BaseModel, Field
+except ImportError:
+    class BaseModel:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+        def dict(self):
+            return self.__dict__
+    def Field(default=None, **kwargs):
+        return default
 
 class HealthResponse(BaseModel):
     status: str
@@ -505,6 +515,46 @@ class AuthResponse(BaseModel):
 class AuthStatusResponse(BaseModel):
     authenticated: bool
     user: UserProfile | None = None
+
+
+# =============================================================================
+# FLOATING AI AGENT & BUG REPORTING SCHEMAS
+# =============================================================================
+
+class BugReportRequest(BaseModel):
+    description: str = Field(..., min_length=5, max_length=3000)
+    error_text: str | None = Field(None, max_length=4000)
+    page_url: str | None = Field(None, max_length=500)
+    severity: str = Field("WARNING")
+    user_contact: str | None = Field(None, max_length=100)
+
+
+class BugReportResponse(BaseModel):
+    success: bool = True
+    incident_id: str
+    status: str = "RECEIVED"
+    message: str = "Bug report received and logged to engineering."
+    created_at: str
+
+
+class BugStatusResponse(BaseModel):
+    incident_id: str
+    status: str
+    severity: str
+    summary: str
+    created_at: str
+
+
+class AskAgentRequest(BaseModel):
+    question: str = Field(..., min_length=2, max_length=1000)
+    history: list[dict[str, str]] | None = None
+
+
+class AskAgentResponse(BaseModel):
+    answer: str
+    source: str = "ai"
+    suggestions: list[str] = []
+
 
 
 
