@@ -52,3 +52,8 @@ def test_cors_origins_parsing():
     from app.config import Settings
     custom_cfg = Settings(cors_origins="https://example.com, https://app.example.com")
     assert custom_cfg.cors_origins == ["https://example.com", "https://app.example.com"]
+
+
+def test_production_cors_origins_configured():
+    from app.config import settings
+    assert "https://khmer-ai-16c.pages.dev" in settings.cors_origins
