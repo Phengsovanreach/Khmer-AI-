@@ -31,9 +31,9 @@ class User(Base):
     name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
-    role = Column(String(20), default="user", nullable=False)
-    status = Column(String(20), default="active", nullable=False)
-    email_verified = Column(Boolean, default=True, nullable=False)
+    role = Column(String(20), default="user", server_default="user", nullable=True)
+    status = Column(String(20), default="active", server_default="active", nullable=False)
+    email_verified = Column(Boolean, default=True, server_default="1", nullable=False)
     avatar_color = Column(String(20), nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(

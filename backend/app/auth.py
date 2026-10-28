@@ -68,16 +68,19 @@ def init_auth_db(db_path: Any = None) -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                action TEXT NOT NULL,
+                operation_id TEXT UNIQUE NOT NULL,
                 user_id TEXT,
-                ip_address TEXT,
+                event_type TEXT NOT NULL,
                 status TEXT NOT NULL,
-                details TEXT,
+                duration_ms REAL DEFAULT 0.0,
+                details_json TEXT,
+                ip_address TEXT,
                 created_at TEXT NOT NULL
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_op ON audit_logs(operation_id)")
         conn.commit()
     conn.close()
 
