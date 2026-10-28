@@ -139,7 +139,7 @@ def test_user_registration_and_duplicate_handling():
     # 2. Duplicate registration attempt must fail safely
     dup_res = client.post("/api/auth/register", json=payload)
     assert dup_res.status_code == 400
-    assert "អ៊ីមែលនេះមានរួចហើយ" in dup_res.json()["detail"]
+    assert "អ៊ីមែល" in dup_res.json()["detail"] and "មានរួចហើយ" in dup_res.json()["detail"]
 
 
 def test_registration_validation_rules():

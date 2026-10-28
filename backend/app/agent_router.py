@@ -1,26 +1,28 @@
 """
-Khmer Translator AI — Floating AI Agent & Bug Reporting Router.
-Provides endpoints for:
-1. ASK Mode: Interactive app Q&A grounded in Khmer Translator AI capabilities.
-2. Bug Mode: In-app bug reporting with database persistence and Telegram dispatch.
-3. Bug Status: Incident status tracking for reported bugs.
+Khmer Translator AI — Floating AI Agent & Interactive Bug Reporting API Router.
+Handles contextual FAQ answering, user bug submissions, incident record tracking,
+and automated escalation to Telegram & ChatGPT Crosswalk execution queue.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import secrets
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 try:
-    from fastapi import APIRouter, HTTPException, Request, status
+    from fastapi import APIRouter, HTTPException, Request, Response, status
 except ImportError:
     class APIRouter:
         def __init__(self, *args, **kwargs):
-            pass
+            self.routes = []
         def post(self, *args, **kwargs):
             def decorator(f):
                 return f
@@ -32,16 +34,19 @@ except ImportError:
 
     class HTTPException(Exception):
         def __init__(self, status_code: int, detail: str = ""):
+            super().__init__(detail)
             self.status_code = status_code
             self.detail = detail
-            super().__init__(f"HTTP {status_code}: {detail}")
 
     class Request:
         pass
 
+    class Response:
+        pass
+
     class status:
+        HTTP_400_BAD_REQUEST = 400
         HTTP_404_NOT_FOUND = 404
-        HTTP_422_UNPROCESSABLE_ENTITY = 422
         HTTP_429_TOO_MANY_REQUESTS = 429
         HTTP_500_INTERNAL_SERVER_ERROR = 500
 
@@ -87,7 +92,7 @@ def _redact(text: str) -> str:
 # =============================================================================
 
 @router.post("/bugs/report", response_model=BugReportResponse)
-async def report_bug(req: BugReportRequest, request: Request):
+def report_bug(req: BugReportRequest, request: Request):
     """
     Submits a user-reported bug or exception directly to the engineering telemetry pipeline.
     Persists report in database and dispatches a sanitized alert to the project Telegram bot.
@@ -131,53 +136,55 @@ async def report_bug(req: BugReportRequest, request: Request):
     except Exception as exc:
         logger.error("Failed to save user bug report to database: %s", exc)
 
-    # 2. Dispatch Telegram alert
-    try:
-        from self_healing.notifications import TelegramNotifier
-        from self_healing.models import format_cambodia_time
+    # 2. Dispatch Telegram alert & Crosswalk relay (non-blocking in background thread)
+    def _dispatch_telemetry():
+        if os.getenv("TESTING") == "1":
+            return
+        try:
+            from self_healing.notifications import TelegramNotifier
+            from self_healing.models import format_cambodia_time
 
-        notifier = TelegramNotifier()
-        if notifier.is_configured:
-            err_block = f"\n<b>Error Log:</b>\n<code>{clean_error[:350]}</code>" if clean_error else ""
-            msg = (
-                f"🐞 <b>KHMER TRANSLATOR AI — USER BUG REPORT</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Incident ID:</b> <code>{incident_id}</code>\n"
-                f"<b>Severity:</b> {req.severity.upper()}\n"
-                f"<b>Page:</b> {clean_url}\n"
-                f"<b>Description:</b>\n"
-                f"<i>{clean_desc}</i>{err_block}\n\n"
-                f"<b>Status:</b> 🟡 RECEIVED (Queued for Autonomous Analysis)\n"
-                f"<b>Time:</b> <code>{format_cambodia_time()}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━"
-            )
-            notifier.send_message(msg)
-    except Exception as exc:
-        logger.warning("Telegram notification failed for bug report: %s", exc)
+            notifier = TelegramNotifier()
+            if notifier.is_configured:
+                err_block = f"\n<b>សារកំហុស (Error Log):</b>\n<code>{clean_error[:350]}</code>" if clean_error else ""
+                msg = (
+                    f"🐞 <b>KHMER TRANSLATOR AI — របាយការណ៍បញ្ហាពីអ្នកប្រើប្រាស់ (USER BUG REPORT)</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>លេខសម្គាល់បញ្ហា (Incident ID):</b> <code>{incident_id}</code>\n"
+                    f"<b>កម្រិតធ្ងន់ធ្ងរ (Severity):</b> {req.severity.upper()}\n"
+                    f"<b>ទំព័រជួបបញ្ហា (Page):</b> {clean_url}\n"
+                    f"<b>ការពិពណ៌នាអំពីបញ្ហា (Description):</b>\n"
+                    f"<i>{clean_desc}</i>{err_block}\n\n"
+                    f"<b>ស្ថានភាព (Status):</b> 🟡 បានទទួល (RECEIVED — រង់ចាំការវិភាគស្វ័យប្រវត្តិ)\n"
+                    f"<b>ពេលវេលា (Time):</b> <code>{format_cambodia_time()}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━"
+                )
+                notifier.send_message(msg)
+        except Exception as exc:
+            logger.warning("Telegram notification failed for bug report: %s", exc)
 
-    # 3. Relay to Crosswalk (best effort)
-    try:
-        import urllib.request
-        from self_healing.config import Config
-        # If Crosswalk key is present in environment
-        cw_key = Config.CROSSWALK_KEY if hasattr(Config, "CROSSWALK_KEY") else None
-        if not cw_key:
-            import os
-            cw_key = os.getenv("CROSSWALK_KEY")
-        if cw_key:
-            payload = {
-                "crosswalk": "chatgptantigravity2",
-                "brief": f"User Bug Report: {incident_id} — {clean_desc[:50]}",
-                "body": f"New user bug report received via floating widget:\n\nIncident ID: {incident_id}\nSeverity: {req.severity}\nPage: {clean_url}\nDescription: {clean_desc}",
-            }
-            req_cw = urllib.request.Request(
-                "https://mcp.crosswalk.to/v1/post",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Authorization": f"Bearer {cw_key}", "Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req_cw, timeout=5)
-    except Exception:
-        pass
+        try:
+            import urllib.request
+            from self_healing.config import Config
+            cw_key = Config.CROSSWALK_KEY if hasattr(Config, "CROSSWALK_KEY") else None
+            if not cw_key:
+                cw_key = os.getenv("CROSSWALK_KEY")
+            if cw_key:
+                payload = {
+                    "crosswalk": "chatgptantigravity2",
+                    "brief": f"User Bug Report: {incident_id} — {clean_desc[:50]}",
+                    "body": f"New user bug report received via floating widget:\n\nIncident ID: {incident_id}\nSeverity: {req.severity}\nPage: {clean_url}\nDescription: {clean_desc}",
+                }
+                req_cw = urllib.request.Request(
+                    "https://mcp.crosswalk.to/v1/post",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {cw_key}", "Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req_cw, timeout=5)
+        except Exception:
+            pass
+
+    threading.Thread(target=_dispatch_telemetry, daemon=True).start()
 
     return BugReportResponse(
         success=True,
@@ -200,142 +207,119 @@ def get_bug_status(incident_id: str):
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Bug report '{clean_id}' not found / រកមិនឃើញរបាយការណ៍នេះទេ",
                 )
+
+            res_notes = None
+            if record.diagnostics_json:
+                try:
+                    diag = json.loads(record.diagnostics_json)
+                    res_notes = diag.get("resolution_notes")
+                except Exception:
+                    pass
+
             return BugStatusResponse(
                 incident_id=record.incident_id,
                 status=record.status,
                 severity=record.severity,
-                summary=record.error_summary,
                 created_at=record.first_detected_utc.isoformat() if record.first_detected_utc else "",
+                summary=record.error_summary,
+                resolution_notes=res_notes,
             )
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Error looking up bug report %s: %s", clean_id, exc)
+        logger.error("Error retrieving bug status: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database lookup error",
+            detail="Error retrieving bug status / មិនអាចទាញយកព័ត៌មានបានទេ",
         )
 
 
 # =============================================================================
-# ASK MODE ENDPOINT
+# KHMER AI AGENT "ASK" MODE (KNOWLEDGE BASE)
 # =============================================================================
 
-# Comprehensive Knowledge Base grounded strictly in Khmer Translator AI
-_KHMER_KNOWLEDGE_BASE = [
+KHMER_AGENT_KB = [
     {
-        "keywords": ["dubbing", "សំឡេង", "voice", "voiceover", "បញ្ចូលសំឡេង"],
-        "answer": (
-            "ប្រព័ន្ធ Khmer Translator AI ប្រើប្រាស់បច្ចេកវិទ្យា Microsoft Edge Neural TTS សម្រាប់សំយោគសំឡេងជាភាសាខ្មែរធម្មជាតិ៖\n\n"
-            "• **km-KH-SreymomNeural**: សំឡេងស្រី សំឡេងស្រទន់ ច្បាស់ និងសមរម្យសម្រាប់ព័ត៌មាន ឬឯកសារ\n"
-            "• **km-KH-PisethNeural**: សំឡេងប្រុស ច្បាស់ រឹងមាំ និងមានថាមពល\n\n"
-            "អ្នកអាចកំណត់ល្បឿន (Rate) និងកម្រិតសំឡេង (Pitch) ព្រមទាំងប្រើមុខងារ Audio Ducking ដើម្បីកាត់បន្ថយសំឡេងដើមនៃវីដេអូដោយស្វ័យប្រវត្តិ។"
-        ),
-        "suggestions": ["តើមានសំឡេងភាសាខ្មែរប៉ុន្មាន?", "តើ Audio Ducking ដំណើរការដូចម្តេច?", "តើភាសាអ្វីខ្លះត្រូវបានគាំទ្រ?"],
+        "keywords": ["សំឡេង", "dubbing", "voice", "ពិសិដ្ឋ", "ស្រីមុំ", "tts", "edge"],
+        "answer": "Khmer Translator គាំទ្រសំឡេងខ្មែរធម្មជាតិកម្រិតខ្ពស់ចំនួន ២ តាមរយៈ Microsoft Edge-TTS:\n1. **កញ្ញា ស្រីមុំ (km-KH-SreymomNeural)** — សំឡេងស្រី ពិរោះរណ្តំ និងច្បាស់ល្អ។\n2. **លោក ពិសិដ្ឋ (km-KH-PisethNeural)** — សំឡេងប្រុស មានអំណាច និងច្បាស់លាស់។\nលោកអ្នកអាចជ្រើសរើសសំឡេងក្នុងផ្ទាំង Dubbing Studio បានភ្លាមៗ!",
+        "suggestions": [
+            "តើធ្វើដូចម្តេចដើម្បីកំណត់ល្បឿនសំឡេង?",
+            "តើប្រព័ន្ធនេះឥតគិតថ្លៃពិតមែនទេ?",
+        ],
     },
     {
-        "keywords": ["ភាសា", "language", "languages", "គាំទ្រ"],
-        "answer": (
-            "Khmer Translator AI គាំទ្រការបកប្រែពហុភាសាជាង ៥០ ភាសាជុំវិញពិភពលោក មកកាន់ភាសាខ្មែរ ឬពីខ្មែរទៅភាសាដទៃ រួមមាន៖\n\n"
-            "• អង់គ្លេស (English), ចិន (Chinese), ជប៉ុន (Japanese), កូរ៉េ (Korean)\n"
-            "• បារាំង (French), ថៃ (Thai), វៀតណាម (Vietnamese)\n\n"
-            "ការបកប្រែប្រើប្រាស់ម៉ូដែល AI កម្រិតខ្ពស់ដែលយល់ពីវេយ្យាករណ៍ និងបរិបទនៃភាសាខ្មែរយ៉ាងច្បាស់លាស់។"
-        ),
-        "suggestions": ["តើបកប្រែពីវីដេអូ YouTube បានទេ?", "តើការបកប្រែចំណាយពេលប៉ុន្មាន?", "តើទាញយកឯកសារ Subtitle យ៉ាងដូចម្តេច?"],
+        "keywords": ["ឥតគិតថ្លៃ", "លុយ", "free", "tier", "ចំណាយ", "ថ្លៃ", "cost"],
+        "answer": "Khmer Translator ដំណើរការលើម៉ូដែល **100% Free & Open-Source Tier** ដោយមិនចាំបាច់មាន OpenAI Key ឬ Paid API ឡើយ! រាល់មុខងារបម្លែងសំឡេង Faster-Whisper, ការបកប្រែ, និងការបញ្ចូលសំឡេង Edge-TTS គឺឥតគិតថ្លៃជាអចិន្ត្រៃយ៍។",
+        "suggestions": [
+            "តើអាចបកប្រែវីដេអូបានកម្រិតណា?",
+            "តើមានសំឡេងភាសាខ្មែរអ្វីខ្លះ?",
+        ],
     },
     {
-        "keywords": ["free", "ថ្លៃ", "លុយ", "price", "pricing", "cost", "គិតថ្លៃ"],
-        "answer": (
-            "Khmer Translator AI ដំណើរការលើហេដ្ឋារចនាសម្ព័ន្ធ **ឥតគិតថ្លៃ ១០០% អចិន្ត្រៃយ៍ ($0.00/ខែ)** ដោយមិនតម្រូវឱ្យមានកាតធនាគារ (Credit Card) ឡើយ៖\n\n"
-            "• គេហទំព័រ Frontend ដំណើរការលើ **Cloudflare Pages** (Free Tier)\n"
-            "• ម៉ាស៊ីនបម្រើ Backend ដំណើរការលើ **Render Web Service** (Free Tier)\n"
-            "• មូលដ្ឋានទិន្នន័យ Postgres ដំណើរការលើ **Neon Serverless PostgreSQL** (Free Tier)\n\n"
-            "អ្នកអាចប្រើប្រាស់មុខងារទាំងអស់ដោយឥតគិតថ្លៃ!"
-        ),
-        "suggestions": ["តើធ្វើដូចម្តេចដើម្បីចុះឈ្មោះ?", "តើទិន្នន័យមានសុវត្ថិភាពឬទេ?", "តើមានដែនកំណត់ទំហំវីដេអូទេ?"],
+        "keywords": ["វីដេអូ", "upload", "video", "ទំហំ", "size", "mp4", "render"],
+        "answer": "លោកអ្នកអាច Upload ឯកសារវីដេអូ (MP4, MKV, MOV, WebM) ឬអូឌីយ៉ូ (MP3, WAV, M4A) ដោយផ្ទាល់។ ប្រព័ន្ធមានបច្ចេកវិទ្យា Chunked Resumable Upload ជួយការពារការដាច់កណ្តាលទីពេលអ៊ីនធឺណិតខ្សោយ។",
+        "suggestions": [
+            "របៀបប្រើប្រាស់ Subtitle Editor Pro",
+            "តើអាច Export ជាទម្រង់អ្វីខ្លះ?",
+        ],
     },
     {
-        "keywords": ["វចនានុក្រម", "dictionary", "បញ្ចេញសំឡេង", "pronunciation", "កែ"],
-        "answer": (
-            "Khmer Translator AI មានមុខងារ **វចនានុក្រមបញ្ចេញសំឡេងផ្ទាល់ខ្លួន (Pronunciation Dictionary Studio)**៖\n\n"
-            "• អនុញ្ញាតឱ្យអ្នកកំណត់ពាក្យបច្ចេកទេស ឈ្មោះមនុស្ស ឬពាក្យកម្ចីភាសាបរទេស\n"
-            "• កំណត់របៀបអានជាភាសាខ្មែរឱ្យបានត្រឹមត្រូវ ១០០% មុនពេលសំយោគសំឡេង Dubbing\n"
-            "• ពាក្យក្នុងវចនានុក្រមនឹងត្រូវយកទៅអនុវត្តលើរាល់គម្រោងរបស់អ្នកដោយស្វ័យប្រវត្តិ។"
-        ),
-        "suggestions": ["តើបញ្ចូលពាក្យថ្មីក្នុងវចនានុក្រមយ៉ាងដូចម្តេច?", "តើ export subtitle ជា SRT បានទេ?", "របៀបប្តូរសំឡេងតួអង្គ"],
+        "keywords": ["export", "ទាញយក", "srt", "vtt", "txt", "ទម្រង់"],
+        "answer": "ក្រោយពេលបកប្រែរួច លោកអ្នកអាច Export បាន ៤ ទម្រង់យ៉ាងងាយស្រួល:\n1. វីដេអូ Dubbed រួចរាល់\n2. ឯកសារ Subtitle SRT (ភាសាខ្មែរ ឬភាសាដើម)\n3. ឯកសារ VTT\n4. អត្ថបទសុទ្ធ TXT ពេញលេញ។",
+        "suggestions": [
+            "តើធ្វើដូចម្តេចដើម្បីកែសម្រួល Subtitle?",
+            "តើមានវចនានុក្រមកែពាក្យខុសទេ?",
+        ],
     },
     {
-        "keywords": ["export", "subtitle", "srt", "vtt", "ទាញយក", "download"],
-        "answer": (
-            "បន្ទាប់ពីការបកប្រែ និង Dubbing រួចរាល់ អ្នកអាចទាញយក (Export) បានជាច្រើនទម្រង់៖\n\n"
-            "1. **ឯកសារ Subtitle**: ទាញយកជា `.SRT`, `.VTT`, ឬ `.TXT`\n"
-            "2. **ឯកសារសំឡេង**: ទាញយកសំឡេង Dubbed Audio Track ជា `.WAV` ឬ `.MP3`\n"
-            "3. **វីដេអូសម្រេច**: វីដេអូដែលបានបញ្ចូលសំឡេងខ្មែរ និង Subtitle ជាប់វីដេអូ (Hardcoded Burn-in) ក្នុងកម្រិតច្បាស់ HD។"
-        ),
-        "suggestions": ["តើកែសម្រួល Subtitle ដោយដៃបានទេ?", "តើធ្វើដូចម្តេចដើម្បីចាប់ផ្តើម?", "តើមាន AI ជំនួយការឆ្លើយតបឬទេ?"],
+        "keywords": ["វចនានុក្រម", "dictionary", "កែពាក្យ", "proofreading", "អក្ខរាវិរុទ្ធ"],
+        "answer": "ប្រព័ន្ធមាន **Khmer Proofreading Studio** និង **Pronunciation Dictionary Studio** ដែលអនុញ្ញាតឱ្យលោកអ្នកកំណត់ពាក្យបច្ចេកទេស និងកែអក្ខរាវិរុទ្ធភាសាខ្មែរឱ្យត្រឹមត្រូវ 100% មុនពេលបង្កើតសំឡេង Dubbing។",
+        "suggestions": [
+            "តើមានសំឡេងភាសាខ្មែរអ្វីខ្លះ?",
+            "របៀប Upload វីដេអូ",
+        ],
     },
+]
+
+DEFAULT_AGENT_ANSWER = (
+    "សូមអរគុណសម្រាប់សំណួរ! ខ្ញុំជា Khmer AI Agent ជំនួយការរបស់លោកអ្នក។ "
+    "លោកអ្នកអាចសាកសួរខ្ញុំអំពី៖ ការបញ្ចូលសំឡេង Dubbing (សំឡេងស្រីមុំ និងពិសិដ្ឋ), "
+    "ការ Upload វីដេអូ, ការកែសម្រួល Subtitles SRT, ឬការប្រើប្រាស់ 100% Free Tier របស់កម្មវិធី។"
+)
+
+DEFAULT_SUGGESTIONS = [
+    "តើមានសំឡេងភាសាខ្មែរអ្វីខ្លះ?",
+    "តើប្រព័ន្ធនេះឥតគិតថ្លៃពិតមែនទេ?",
+    "តើអាច Export ជាទម្រង់អ្វីខ្លះ?",
 ]
 
 
 @router.post("/agent/ask", response_model=AskAgentResponse)
-async def ask_agent(req: AskAgentRequest):
+def ask_agent(req: AskAgentRequest):
     """
-    Answers user queries about Khmer Translator AI features, capabilities, and guidance.
-    Uses Gemini AI if configured, with an accurate, pre-grounded fallback knowledge base.
+    Answers user questions regarding Khmer Translator AI features, dubbing voices,
+    and workflows using an embedded grounded knowledge base.
     """
-    q = req.question.strip().lower()
+    q_lower = req.question.strip().lower()
 
-    # Try Gemini AI first if configured
-    try:
-        from self_healing.ai.gemini_provider import GeminiProvider
-        provider = GeminiProvider()
-        if provider.is_available():
-            system_prompt = (
-                "You are the official Khmer Translator AI assistant. Answer user queries in natural, polite Khmer. "
-                "The app provides AI speech-to-text with Faster-Whisper, multilingual translation into Khmer, "
-                "and Edge TTS Khmer voice dubbing (voices: km-KH-SreymomNeural and km-KH-PisethNeural). "
-                "The service runs 100% free permanently ($0.00/month, zero credit card) on Cloudflare Pages, Render, and Neon PostgreSQL. "
-                "Keep answers concise, direct, helpful, and formatted with markdown."
-            )
-            ai_ans = provider.generate_text(f"{system_prompt}\n\nUser Question: {req.question}")
-            if ai_ans and len(ai_ans.strip()) > 10:
-                return AskAgentResponse(
-                    answer=ai_ans.strip(),
-                    source="ai",
-                    suggestions=[
-                        "តើមានសំឡេងភាសាខ្មែរប៉ុន្មាន?",
-                        "តើធ្វើដូចម្តេចដើម្បីបញ្ចូលសំឡេង dubbing?",
-                        "តើប្រព័ន្ធនេះឥតគិតថ្លៃពិតមែនទេ?",
-                    ],
-                )
-    except Exception as exc:
-        logger.debug("Gemini query fallback to knowledge base: %s", exc)
+    matched_entry = None
+    max_matches = 0
 
-    # Intelligent Knowledge Base Grounding
-    for item in _KHMER_KNOWLEDGE_BASE:
-        if any(kw in q for kw in item["keywords"]):
-            return AskAgentResponse(
-                answer=item["answer"],
-                source="knowledge_base",
-                suggestions=item["suggestions"],
-            )
+    for item in KHMER_AGENT_KB:
+        matches = sum(1 for kw in item["keywords"] if kw in q_lower)
+        if matches > max_matches:
+            max_matches = matches
+            matched_entry = item
 
-    # Default friendly Khmer response with key features
-    default_ans = (
-        "សូមស្វាគមន៍មកកាន់ **Khmer Translator AI (ជំនួយការឆ្លាតវៃ)**! 🙏\n\n"
-        "ខ្ញុំអាចជួយអ្នកលើបញ្ហា និងមុខងារសំខាន់ៗដូចជា៖\n"
-        "• **ការបកប្រែវីដេអូ & សំឡេង**: បំប្លែងសំឡេងនិយាយជាអក្សរ និងបកប្រែមកជាភាសាខ្មែរ\n"
-        "• **សំឡេង Dubbing ភាសាខ្មែរ**: ប្រើប្រាស់សំឡេង Sreymom និង Piseth ជាមួយ Audio Ducking\n"
-        "• **វចនានុក្រមបញ្ចេញសំឡេង**: កំណត់ពាក្យពិបាកអាន ឬពាក្យបច្ចេកទេសឱ្យអានបានត្រឹមត្រូវ\n"
-        "• **ការទាញយក**: Export ជាវីដេអូសម្រេច, MP3 Audio, ឬ Subtitle (SRT/VTT)\n\n"
-        "ប្រសិនបើអ្នកជួបបញ្ហាបច្ចេកទេស អ្នកអាចប្តូរទៅកាន់ **Bug Mode (រាយការណ៍បញ្ហា)** ដើម្បីផ្ញើកំហុសទៅកាន់ក្រុមវិស្វករបានភ្លាមៗ!"
-    )
+    if matched_entry and max_matches > 0:
+        return AskAgentResponse(
+            answer=matched_entry["answer"],
+            suggestions=matched_entry["suggestions"],
+            source="khmer_translator_knowledge_base",
+        )
+
     return AskAgentResponse(
-        answer=default_ans,
-        source="knowledge_base",
-        suggestions=[
-            "តើធ្វើដូចម្តេចដើម្បីបញ្ចូលសំឡេង dubbing?",
-            "តើភាសាអ្វីខ្លះត្រូវបានគាំទ្រ?",
-            "តើប្រព័ន្ធនេះឥតគិតថ្លៃពិតមែនទេ?",
-        ],
+        answer=DEFAULT_AGENT_ANSWER,
+        suggestions=DEFAULT_SUGGESTIONS,
+        source="khmer_translator_fallback",
     )

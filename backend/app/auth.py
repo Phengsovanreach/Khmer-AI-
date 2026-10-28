@@ -79,6 +79,8 @@ def init_auth_db(db_path: Any = None) -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email))")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name_lower ON users(LOWER(name))")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_op ON audit_logs(operation_id)")
         conn.commit()
@@ -90,6 +92,31 @@ def init_auth_db(db_path: Any = None) -> None:
 
 # Email regex validation
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+
+def normalize_email(email: str | None) -> str:
+    """Normalize email address consistently (strip whitespace, lowercase)."""
+    return (email or "").strip().lower()
+
+
+def normalize_username(name: str | None) -> str:
+    """Normalize username/display name (strip whitespace)."""
+    return (name or "").strip()
+
+
+def mask_email(email: str | None) -> str:
+    """Mask email address for privacy-safe logs and Telegram alerts (e.g. j***e@domain.com)."""
+    clean = normalize_email(email)
+    if not clean or "@" not in clean:
+        return "***"
+    local_part, domain = clean.split("@", 1)
+    if len(local_part) <= 1:
+        masked_local = "*"
+    elif len(local_part) == 2:
+        masked_local = f"{local_part[0]}*"
+    else:
+        masked_local = f"{local_part[0]}***{local_part[-1]}"
+    return f"{masked_local}@{domain}"
 
 
 
@@ -262,6 +289,9 @@ def record_audit_event(
         try:
             from self_healing.notifications import TelegramNotifier, format_user_activity_alert
             notifier = TelegramNotifier()
+            username = details.get("username") if details else None
+            masked_email = details.get("masked_email") if details else None
+            environment = details.get("environment") if details else ("production" if os.getenv("RENDER") else "development")
             msg = format_user_activity_alert(
                 event=event_type,
                 user_id=user_id or "anonymous",
@@ -270,10 +300,13 @@ def record_audit_event(
                 duration_sec=duration_ms / 1000.0,
                 error_category=details.get("error_category") if details else None,
                 result_summary=details.get("summary") if details else None,
+                username=username,
+                masked_email=masked_email,
+                environment=environment,
             )
             notifier.send_message(msg)
         except Exception as exc:
-            logger.debug("Failed to dispatch Telegram audit notification: %s", exc)
+            logger.debug("Failed to dispatch Telegram audit notification (non-fatal): %s", exc)
 
     return op_id
 
@@ -292,8 +325,8 @@ def register_user(
 ) -> tuple[dict[str, Any], str]:
     """Register a new user account with Argon2id hashed password and create session."""
     t0 = time.perf_counter()
-    clean_name = name.strip()
-    clean_email = email.strip().lower()
+    clean_name = normalize_username(name)
+    clean_email = normalize_email(email)
 
     if len(clean_name) < 2:
         raise ValueError("Name must be at least 2 characters long / ឈ្មោះត្រូវមានយ៉ាងហោចណាស់ ២ តួអក្សរ")
@@ -307,34 +340,63 @@ def register_user(
     now = datetime.now(timezone.utc)
     avatar_color = _generate_avatar_color(clean_name)
 
-    with db_session_scope() as session:
-        existing = session.query(User).filter(User.email == clean_email).first()
-        if existing:
-            record_audit_event(
-                event_type="User Registration",
-                status="FAILED",
-                user_id=None,
-                duration_ms=(time.perf_counter() - t0) * 1000,
-                details={"error_category": "Duplicate Email", "summary": "Registration attempted with existing email"},
-                ip_address=client_ip,
-                notify_telegram=False,
-            )
-            raise ValueError("An account with this email address already exists / អ៊ីមែលនេះមានរួចហើយ")
+    from sqlalchemy import func
+    from sqlalchemy.exc import IntegrityError
+    import sqlite3
 
-        new_user = User(
-            id=user_id,
-            name=clean_name,
-            email=clean_email,
-            password_hash=p_hash,
-            role="user",
-            status="active",
-            email_verified=True,
-            avatar_color=avatar_color,
-            created_at=now,
-            updated_at=now,
-            last_login_at=now,
+    try:
+        with db_session_scope() as session:
+            existing = session.query(User).filter(
+                (func.lower(User.email) == clean_email) | (func.lower(User.name) == clean_name.lower())
+            ).first()
+            if existing:
+                record_audit_event(
+                    event_type="User Registration",
+                    status="FAILED",
+                    user_id=None,
+                    duration_ms=(time.perf_counter() - t0) * 1000,
+                    details={
+                        "error_category": "Duplicate Account",
+                        "summary": "Registration attempted with existing email or username",
+                        "username": clean_name,
+                        "masked_email": mask_email(clean_email),
+                    },
+                    ip_address=client_ip,
+                    notify_telegram=False,
+                )
+                raise ValueError("An account with this email address or username already exists. Please log in / គណនីជាមួយអ៊ីមែលឬឈ្មោះនេះមានរួចហើយ សូមចូលប្រើប្រាស់។")
+
+            new_user = User(
+                id=user_id,
+                name=clean_name,
+                email=clean_email,
+                password_hash=p_hash,
+                role="user",
+                status="active",
+                email_verified=True,
+                avatar_color=avatar_color,
+                created_at=now,
+                updated_at=now,
+                last_login_at=now,
+            )
+            session.add(new_user)
+    except (IntegrityError, sqlite3.IntegrityError) as err:
+        logger.warning("Concurrent duplicate user registration caught by DB constraint: %s", err)
+        record_audit_event(
+            event_type="User Registration",
+            status="FAILED",
+            user_id=None,
+            duration_ms=(time.perf_counter() - t0) * 1000,
+            details={
+                "error_category": "Concurrent Duplicate",
+                "summary": "Duplicate user caught by database unique constraint",
+                "username": clean_name,
+                "masked_email": mask_email(clean_email),
+            },
+            ip_address=client_ip,
+            notify_telegram=False,
         )
-        session.add(new_user)
+        raise ValueError("An account with this email address or username already exists. Please log in / គណនីជាមួយអ៊ីមែលឬឈ្មោះនេះមានរួចហើយ សូមចូលប្រើប្រាស់។")
 
     user_dict = {
         "id": user_id,
@@ -363,7 +425,12 @@ def register_user(
         status="SUCCESS",
         user_id=user_id,
         duration_ms=duration_ms,
-        details={"summary": "New user account registered successfully"},
+        details={
+            "summary": "New user account registered successfully",
+            "username": clean_name,
+            "masked_email": mask_email(clean_email),
+            "environment": os.getenv("ENVIRONMENT", "production" if os.getenv("RENDER") else "development"),
+        },
         ip_address=client_ip,
         notify_telegram=True,
     )
@@ -379,15 +446,20 @@ def login_user(
     client_ip: str | None = None,
     user_agent: str | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Authenticate user with email and password, returning user profile and session token."""
+    """Authenticate user with email or username and password, returning user profile and session token."""
     t0 = time.perf_counter()
-    clean_email = email.strip().lower()
-    rate_key = f"{client_ip or 'ip'}:{clean_email}"
+    clean_ident = (email or "").strip()
+    clean_ident_lower = clean_ident.lower()
+    rate_key = f"{client_ip or 'ip'}:{clean_ident_lower}"
     _check_rate_limit(rate_key)
+
+    from sqlalchemy import func
 
     session = SessionLocal()
     try:
-        user = session.query(User).filter(User.email == clean_email).first()
+        user = session.query(User).filter(
+            (func.lower(User.email) == clean_ident_lower) | (func.lower(User.name) == clean_ident_lower)
+        ).first()
         if not user:
             _record_failed_attempt(rate_key)
             duration_ms = (time.perf_counter() - t0) * 1000
@@ -396,7 +468,12 @@ def login_user(
                 status="FAILED",
                 user_id=None,
                 duration_ms=duration_ms,
-                details={"error_category": "Invalid Credentials", "summary": "Email not found"},
+                details={
+                    "error_category": "Invalid Credentials",
+                    "summary": "Identifier not found",
+                    "username": clean_ident if "@" not in clean_ident else None,
+                    "masked_email": mask_email(clean_ident) if "@" in clean_ident else None,
+                },
                 ip_address=client_ip,
                 notify_telegram=False,
             )
@@ -414,7 +491,12 @@ def login_user(
                 status="FAILED",
                 user_id=user.id,
                 duration_ms=duration_ms,
-                details={"error_category": "Password Mismatch", "summary": "Incorrect password entered"},
+                details={
+                    "error_category": "Password Mismatch",
+                    "summary": "Incorrect password entered",
+                    "username": user.name,
+                    "masked_email": mask_email(user.email),
+                },
                 ip_address=client_ip,
                 notify_telegram=False,
             )
@@ -449,7 +531,12 @@ def login_user(
         status="SUCCESS",
         user_id=user_dict["id"],
         duration_ms=duration_ms,
-        details={"summary": "User logged in successfully via web interface"},
+        details={
+            "summary": "User logged in successfully via web interface",
+            "username": user_dict["name"],
+            "masked_email": mask_email(user_dict["email"]),
+            "environment": os.getenv("ENVIRONMENT", "production" if os.getenv("RENDER") else "development"),
+        },
         ip_address=client_ip,
         notify_telegram=True,
     )

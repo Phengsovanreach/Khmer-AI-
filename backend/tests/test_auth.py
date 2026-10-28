@@ -59,7 +59,7 @@ def test_auth_registration_duplicate_rejected():
     # Second registration with same email
     r2 = client.post("/api/auth/register", json=payload)
     assert r2.status_code == 400
-    assert "អ៊ីមែលនេះមានរួចហើយ" in r2.json()["detail"]
+    assert "អ៊ីមែល" in r2.json()["detail"] and "មានរួចហើយ" in r2.json()["detail"]
 
 
 def test_auth_registration_validation_errors():

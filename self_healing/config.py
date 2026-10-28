@@ -77,12 +77,14 @@ class Config:
 _THAI_CHAR_PATTERN = re.compile(r"[\u0E00-\u0E7F]+")
 
 _REDACT_PATTERNS = [
-    re.compile(r"\b\d{9,10}:[a-zA-Z0-9_-]{35}\b"),              # Telegram bot tokens
+    re.compile(r"\b\d{9,10}:[a-zA-Z0-9_-]{25,50}\b"),         # Telegram bot tokens
     re.compile(r"ghp_[a-zA-Z0-9]{36,255}"),                      # GitHub classic PATs
     re.compile(r"github_pat_[a-zA-Z0-9_]{50,255}"),              # GitHub fine-grained PATs
     re.compile(r"AIza[0-9A-Za-z-_]{35}"),                        # Google API keys
     re.compile(r"sk-[a-zA-Z0-9]{20,64}"),                        # OpenAI API keys
     re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{15,}", re.IGNORECASE),  # Bearer tokens
+    re.compile(r"\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+"), # Argon2id hashes
+    re.compile(r"\$2[aby]\$\d{2}\$[A-Za-z0-9./]{53}"),           # Bcrypt hashes
     re.compile(r"(password[\"']?\s*[:=]\s*[\"'])([^\"']+)([\"'])", re.IGNORECASE),
 ]
 
