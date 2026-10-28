@@ -151,6 +151,20 @@ export const authFetch = async (url: string, init: RequestInit = {}): Promise<Re
   });
 };
 
+export const formatErrorMessage = (err: unknown, defaultFallback: string = 'ដំណើរការមិនបានជោគជ័យ'): string => {
+  if (!err) return defaultFallback;
+  const raw = err instanceof Error ? err.message : String(err);
+  if (
+    raw.toLowerCase().includes('failed to fetch') ||
+    raw.toLowerCase().includes('networkerror') ||
+    raw.toLowerCase().includes('load failed') ||
+    raw.includes('net::ERR')
+  ) {
+    return 'មិនអាចភ្ជាប់ទៅកាន់ម៉ាស៊ីនបម្រើ Cloud Backend បានទេ (ម៉ាស៊ីនបម្រើកំពុងចាប់ផ្ដើមដំណើរការឡើងវិញ Cold Start ឬបញ្ហាអ៊ីនធឺណិត)។ សូមរង់ចាំបន្តិច ហើយសាកល្បងម្ដងទៀត។';
+  }
+  return raw;
+};
+
 const SUPPORTED_EXTS = [
   '.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v',
   '.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac', '.opus'
@@ -1355,7 +1369,7 @@ export default function App() {
       setTranslationSegments(data.translation || []);
       setNotice(`ការបកប្រែជាភាសា ${tgt} បានជោគជ័យពេញលេញ (100%)!`);
     } catch (err: any) {
-      setError(err.message || 'បរាជ័យក្នុងការបកប្រែ');
+      setError(formatErrorMessage(err, 'បរាជ័យក្នុងការបកប្រែ'));
     } finally {
       setBusy(false);
     }
@@ -1593,7 +1607,7 @@ export default function App() {
       await loadState();
       setNotice('ការចាប់ផ្តើមឡើងវិញបានជោគជ័យពេញលេញ!');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'ការចាប់ផ្តើមឡើងវិញបរាជ័យ');
+      setError(formatErrorMessage(err, 'ការចាប់ផ្តើមឡើងវិញបរាជ័យ'));
     } finally {
       setBusy(false);
     }
@@ -1663,7 +1677,7 @@ export default function App() {
         );
       }
     } catch (err: any) {
-      setError(err instanceof Error ? err.message : 'ការបន្ត Upload បរាជ័យ');
+      setError(formatErrorMessage(err, 'ការបន្ត Upload បរាជ័យ'));
     } finally {
       setBusy(false);
       setStatusStage('');
@@ -1730,7 +1744,7 @@ export default function App() {
         setError(`ការ Upload វីដេអូបានជោគជ័យ ១០០% ប៉ុន្តែការស្គាល់សំឡេងមានបញ្ហា: ${transcribeErr.message || transcribeErr}។ ឯកសារត្រូវបានរក្សាទុកនៅលើ Server រួចហើយ អ្នកអាចចុចប៊ូតុង "សាកល្បងម្ដងទៀត" ដោយមិនបាច់ Upload ឡើងវិញទេ។`);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'ដំណើរការបរាជ័យ');
+      setError(formatErrorMessage(err, 'ដំណើរការបរាជ័យ'));
     } finally {
       setBusy(false);
       setStatusStage('');
@@ -1775,7 +1789,7 @@ export default function App() {
         setNotice('ការស្គាល់សំឡេង និងការវិភាគសំឡេងតួអង្គបានជោគជ័យពេញលេញ!');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'ការស្គាល់សំឡេងបរាជ័យ');
+      setError(formatErrorMessage(err, 'ការស្គាល់សំឡេងបរាជ័យ'));
     } finally {
       setBusy(false);
       setStatusStage('');
@@ -1820,7 +1834,7 @@ export default function App() {
           setError(`ការ Upload វីដេអូបានជោគជ័យ ១០០% ប៉ុន្តែការបកប្រែ/បញ្ចូលសំឡេងមានបញ្ហា: ${transcribeErr.message || transcribeErr}។ ឯកសារត្រូវបានរក្សាទុកនៅលើ Server រួចហើយ អ្នកអាចចុចប៊ូតុង "សាកល្បងម្ដងទៀត" ដោយមិនបាច់ Upload ឡើងវិញទេ។`);
         }
       } catch (err: any) {
-        setError(err instanceof Error ? err.message : 'Upload failed');
+        setError(formatErrorMessage(err, 'ការ Upload បរាជ័យ'));
       } finally {
         setBusy(false);
         setStatusStage('');

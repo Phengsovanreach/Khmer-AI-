@@ -217,27 +217,50 @@ export class MediaUploadController {
     });
 
     try {
-      // 1. Initialize Chunked Upload on Server
+      // 1. Initialize Chunked Upload on Server with Cold-Start Resilience
       const initUrl = `${this.options.apiBase}/api/upload/init`;
       const authHeaders = AuthService.getAuthHeaders();
-      const initRes = await fetch(initUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
-        credentials: 'include',
-        body: JSON.stringify({
-          filename: this.file.name,
-          file_size: this.file.size,
-          chunk_size: this.chunkSize,
-          total_chunks: this.totalChunks,
-          source_language: this.options.sourceLang || 'auto',
-          target_language: this.options.targetLang || 'km',
-          name: this.options.name,
-        }),
-      });
+      let initRes: Response | null = null;
+      let lastInitErr: any = null;
 
-      if (!initRes.ok) {
-        const errJson = await initRes.json().catch(() => ({}));
-        throw new Error(errJson.detail || 'បរាជ័យក្នុងការចាប់ផ្តើម Upload Session');
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          if (attempt > 0) {
+            this.updateProgress({
+              statusKhmer: '🔄 ម៉ាស៊ីនបម្រើ Cloud Backend កំពុងចាប់ផ្ដើមដំណើរការឡើងវិញ (Server is waking up)... សូមរង់ចាំបន្តិច',
+              statusEnglish: 'Server is waking up from sleep, retrying connection...',
+            });
+            await new Promise((r) => setTimeout(r, 2500));
+          }
+          initRes = await fetch(initUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...authHeaders },
+            credentials: 'include',
+            body: JSON.stringify({
+              filename: this.file.name,
+              file_size: this.file.size,
+              chunk_size: this.chunkSize,
+              total_chunks: this.totalChunks,
+              source_language: this.options.sourceLang || 'auto',
+              target_language: this.options.targetLang || 'km',
+              name: this.options.name,
+            }),
+          });
+          if (initRes && (initRes.ok || initRes.status < 500)) {
+            break;
+          }
+        } catch (fetchErr: any) {
+          lastInitErr = fetchErr;
+          if (attempt === 2) break;
+        }
+      }
+
+      if (!initRes || !initRes.ok) {
+        if (!initRes && lastInitErr) {
+          throw new Error('មិនអាចភ្ជាប់ទៅកាន់ម៉ាស៊ីនបម្រើ Cloud Backend បានទេ (ម៉ាស៊ីនបម្រើកំពុងចាប់ផ្ដើមដំណើរការឡើងវិញ Cold Start ឬគ្មានអ៊ីនធឺណិត)។ សូមព្យាយាមម្ដងទៀត។');
+        }
+        const errJson = await initRes?.json().catch(() => ({}));
+        throw new Error(errJson?.detail || 'បរាជ័យក្នុងការចាប់ផ្តើម Upload Session');
       }
 
       const initData = await initRes.json();
