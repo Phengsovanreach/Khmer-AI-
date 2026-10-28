@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 Base = declarative_base()
 
 # Resolve Database URL
-_RAW_DB_URL = os.getenv("DATABASE_URL", "").strip()
+_RAW_DB_URL = os.getenv("DATABASE_URL", "").strip().strip("'\"")
 
 if not _RAW_DB_URL:
     # Fallback to local SQLite under backend/auth.db

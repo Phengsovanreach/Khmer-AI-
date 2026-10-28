@@ -64,3 +64,4 @@ self_healing_state.json
 .DS_Store
 Thumbs.db
 desktop.ini
+.neon
