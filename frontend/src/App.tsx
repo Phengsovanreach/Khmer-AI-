@@ -81,6 +81,7 @@ import {
   KhmerBorderDivider,
 } from './components/CambodianCulturalBackground';
 import { AnimatedDevata } from './components/AnimatedDevata';
+import { FloatingKhmerAIAgent } from './components/FloatingKhmerAIAgent';
 import {
   AppSettings,
   Caps,
@@ -3745,6 +3746,8 @@ export default function App() {
           onClose={() => setShowOnboarding(false)}
           onNavigateToWorkspace={() => setSection('Workspace')}
         />
+
+        <FloatingKhmerAIAgent API_BASE={API} />
       </AnimatePresence>
     </div>
   );

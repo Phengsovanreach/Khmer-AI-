@@ -130,6 +130,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from .agent_router import router as agent_router
+app.include_router(agent_router)
+
 
 def get_current_user_optional(
     request: Request,
