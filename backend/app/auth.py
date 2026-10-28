@@ -22,10 +22,67 @@ from typing import Any, Optional
 
 
 
-from .db.database import SessionLocal, init_db, db_session_scope
+from .db.database import SessionLocal, init_db, db_session_scope, set_db_url
 from .db.models import User, Session as UserSession, AuditLog
 
 logger = logging.getLogger(__name__)
+
+# Legacy database file paths for SQLite testing compatibility
+AUTH_DB_PATH = Path(__file__).resolve().parents[1] / "auth.db"
+AUTH_DB_FILE = AUTH_DB_PATH
+
+
+def init_auth_db(db_path: Any = None) -> None:
+    """Initialize auth tables in database (supporting backward compatibility with SQLite test fixtures)."""
+    target_path = Path(db_path) if db_path else AUTH_DB_FILE
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    import sqlite3
+    conn = sqlite3.connect(str(target_path), check_same_thread=False)
+    with conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'user',
+                status TEXT DEFAULT 'active',
+                email_verified INTEGER DEFAULT 1,
+                avatar_color TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                last_login_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                user_id TEXT,
+                ip_address TEXT,
+                status TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)")
+    conn.close()
+
+    # Rebind SQLAlchemy to target SQLite database
+    set_db_url(f"sqlite:///{target_path.resolve().as_posix()}")
+
 
 # Email regex validation
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")

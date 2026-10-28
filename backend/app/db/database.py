@@ -58,6 +58,31 @@ engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def set_db_url(new_url: str) -> None:
+    """Dynamically reconfigures database engine and SessionLocal (used for test isolation)."""
+    global engine, SessionLocal, DATABASE_URL, IS_POSTGRES, IS_SQLITE
+    DATABASE_URL = new_url
+    IS_POSTGRES = DATABASE_URL.startswith("postgresql")
+    IS_SQLITE = DATABASE_URL.startswith("sqlite")
+    kwargs: dict[str, Any] = {"pool_pre_ping": True}
+    if IS_SQLITE:
+        kwargs["connect_args"] = {"check_same_thread": False}
+    elif IS_POSTGRES:
+        kwargs.update({
+            "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
+            "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "20")),
+            "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")),
+            "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "30")),
+        })
+    engine = create_engine(DATABASE_URL, **kwargs)
+    SessionLocal.configure(bind=engine)
+    try:
+        from . import models  # noqa: F401
+        Base.metadata.create_all(bind=engine)
+    except Exception as exc:
+        logger.warning("Auto schema creation on set_db_url encountered: %s", exc)
+
+
 def init_db() -> None:
     """Initialize database tables safely if they do not exist."""
     try:
