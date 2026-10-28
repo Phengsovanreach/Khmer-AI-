@@ -33,7 +33,7 @@ def test_bug_report_success():
     mock_request = MagicMock()
     mock_request.client.host = "127.0.0.1"
 
-    data = asyncio.run(report_bug(req, mock_request))
+    data = report_bug(req, mock_request)
     assert data.success is True
     assert data.incident_id.startswith("BUG-")
     assert data.status == "RECEIVED"
@@ -57,7 +57,7 @@ def test_bug_status_lifecycle():
     mock_request = MagicMock()
     mock_request.client.host = "127.0.0.1"
 
-    created = asyncio.run(report_bug(req, mock_request))
+    created = report_bug(req, mock_request)
     inc_id = created.incident_id
 
     # 2. Check status
@@ -77,11 +77,11 @@ def test_bug_status_not_found():
 def test_ask_agent_knowledge_base():
     # Test dubbing query
     dubbing_req = AskAgentRequest(question="តើមានសំឡេងភាសាខ្មែរអ្វីខ្លះសម្រាប់ Dubbing?")
-    data = asyncio.run(ask_agent(dubbing_req))
+    data = ask_agent(dubbing_req)
     assert "Sreymom" in data.answer or "Piseth" in data.answer
     assert len(data.suggestions) > 0
 
     # Test free tier query
     free_req = AskAgentRequest(question="តើប្រព័ន្ធនេះឥតគិតថ្លៃទេ?")
-    free_data = asyncio.run(ask_agent(free_req))
+    free_data = ask_agent(free_req)
     assert "ឥតគិតថ្លៃ" in free_data.answer or "Free" in free_data.answer

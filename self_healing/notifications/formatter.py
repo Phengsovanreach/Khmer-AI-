@@ -175,11 +175,25 @@ def format_user_activity_alert(
     result_summary: Optional[str] = None,
     ai_action: Optional[str] = None,
     timestamp_kh: Optional[str] = None,
+    username: Optional[str] = None,
+    masked_email: Optional[str] = None,
+    environment: Optional[str] = None,
 ) -> str:
     """Formats privacy-conscious user operations audit matching Master Prompt specification."""
     time_str = timestamp_kh or format_cambodia_time()
     clean_user = user_id[:16] if user_id else "usr_anonymous"
     is_success = status.upper() == "SUCCESS"
+
+    user_meta_lines = []
+    if username:
+        user_meta_lines.append(f"<b>Username:</b> <code>{redact_secrets(username)}</code>")
+    if masked_email:
+        user_meta_lines.append(f"<b>Email:</b> <code>{redact_secrets(masked_email)}</code>")
+    if environment:
+        user_meta_lines.append(f"<b>Environment:</b> <code>{environment}</code>")
+    user_meta_str = "\n".join(user_meta_lines)
+    if user_meta_str:
+        user_meta_str += "\n"
 
     if is_success:
         res_text = result_summary or "The requested operation completed successfully."
@@ -188,6 +202,7 @@ def format_user_activity_alert(
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Event:</b> {event}\n"
             f"<b>User:</b> <code>{clean_user}</code>\n"
+            f"{user_meta_str}"
             f"<b>Operation ID:</b> <code>{operation_id}</code>\n"
             f"<b>Status:</b> 🟢 SUCCESS\n"
             f"<b>Duration:</b> <code>{duration_sec:.2f}s</code>\n"
@@ -203,6 +218,7 @@ def format_user_activity_alert(
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Event:</b> {event}\n"
             f"<b>User:</b> <code>{clean_user}</code>\n"
+            f"{user_meta_str}"
             f"<b>Operation ID:</b> <code>{operation_id}</code>\n"
             f"<b>Status:</b> 🔴 FAILED\n"
             f"<b>Error Category:</b> {err_cat}\n"
