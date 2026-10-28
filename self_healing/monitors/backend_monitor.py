@@ -127,8 +127,10 @@ def _probe_readiness(ready_url: str, timeout_sec: int = 15) -> dict:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                checks = data.get("checks", {})
                 return {
                     "status": data.get("status"),
+                    "database": checks.get("database", data.get("database", True)),
                     "ffmpeg": data.get("ffmpeg"),
                     "faster_whisper": data.get("faster_whisper"),
                     "tts": data.get("tts"),
@@ -137,3 +139,4 @@ def _probe_readiness(ready_url: str, timeout_sec: int = 15) -> dict:
     except Exception as exc:
         return {"probe_error": redact_secrets(str(exc))}
     return {}
+

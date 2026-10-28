@@ -127,12 +127,38 @@ class RepairWorker:
                 tests_passed=True,
             )
 
+            # Persist to PostgreSQL ai_fix_history table
+            self._record_ai_fix_to_db(proposal, diagnosis.probable_root_cause, test_log)
+
             # Switch back safely to original branch
             self._run_git(["checkout", Config.PRODUCTION_BRANCH])
             return True, proposal, "Repair validated successfully on isolated branch."
 
         finally:
             self.release_lock()
+
+    def _record_ai_fix_to_db(self, proposal: RepairProposal, root_cause: str, test_log: str) -> None:
+        """Persists AI code repair proposal to relational database."""
+        try:
+            import json
+            from backend.app.db.database import db_session_scope
+            from backend.app.db.models import AIFixRecord
+            with db_session_scope() as session:
+                rec = AIFixRecord(
+                    incident_id=proposal.incident_id,
+                    root_cause=root_cause,
+                    target_files=json.dumps(proposal.target_files),
+                    diff_content=proposal.diff_content,
+                    tests_passed=proposal.tests_passed,
+                    test_results=test_log[:1000],
+                    deployment_status="NOT_DEPLOYED",
+                    health_verified=False,
+                    rollback_occurred=False,
+                )
+                session.add(rec)
+        except Exception as exc:
+            logger.debug("Database AI fix recording skipped: %s", exc)
+
 
     def _run_git(self, args: list[str]) -> str:
         """Executes a git command in the repository."""

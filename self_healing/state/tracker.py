@@ -173,3 +173,43 @@ class IncidentTracker:
         """Records the timestamp of the hourly AI inspection report."""
         self._state["last_hourly_ai_report_utc"] = datetime.now(timezone.utc).isoformat()
         self.save()
+
+
+def sync_incident_to_db(incident: Incident) -> None:
+    """Safely synchronizes incident record to the PostgreSQL/SQLite database."""
+    try:
+        from backend.app.db.database import db_session_scope
+        from backend.app.db.models import IncidentRecord
+
+        with db_session_scope() as session:
+            rec = session.query(IncidentRecord).filter(IncidentRecord.incident_id == incident.incident_id).first()
+            first_dt = datetime.fromisoformat(incident.first_detected_utc)
+            last_dt = datetime.fromisoformat(incident.last_detected_utc)
+            if not rec:
+                rec = IncidentRecord(
+                    incident_id=incident.incident_id,
+                    service=incident.service.value,
+                    status=incident.status.value,
+                    consecutive_failures=incident.consecutive_failures,
+                    error_summary=incident.error_summary,
+                    first_detected_utc=first_dt,
+                    last_detected_utc=last_dt,
+                    diagnostics_json=json.dumps(incident.diagnostics),
+                    repair_attempts=incident.repair_attempts,
+                    pull_request_url=incident.pull_request_url,
+                    recovery_confirmations=incident.recovery_confirmations,
+                    notified_states=json.dumps(incident.notified_states),
+                )
+                session.add(rec)
+            else:
+                rec.status = incident.status.value
+                rec.consecutive_failures = incident.consecutive_failures
+                rec.last_detected_utc = last_dt
+                rec.diagnostics_json = json.dumps(incident.diagnostics)
+                rec.repair_attempts = incident.repair_attempts
+                rec.pull_request_url = incident.pull_request_url
+                rec.recovery_confirmations = incident.recovery_confirmations
+                rec.notified_states = json.dumps(incident.notified_states)
+    except Exception as exc:
+        logger.debug("Database sync skipped: %s", exc)
+

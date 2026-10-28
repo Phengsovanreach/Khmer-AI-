@@ -1,50 +1,57 @@
-"""Khmer Translator — Production Authentication Engine (Angkor Nexus).
+"""Khmer Translator — Production Authentication Engine (Angkor Nexus & SQLAlchemy).
 
 Provides secure user registration, credential verification, OWASP Argon2id password hashing
 (with seamless PBKDF2 migration), cryptographic session tokens, brute-force rate limiting,
-cross-device session management, and SQLite persistence.
+cross-device session management, audit logging, and PostgreSQL/SQLite persistence.
 """
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
 import logging
 import os
 import re
 import secrets
-import sqlite3
 import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+
 from pathlib import Path
 from typing import Any, Optional
 
-import argon2
 
-from .config import AUTH_DB_PATH, BASE_DIR
+
+from .db.database import SessionLocal, init_db, db_session_scope
+from .db.models import User, Session as UserSession, AuditLog
 
 logger = logging.getLogger(__name__)
-
-_DB_LOCK = threading.Lock()
 
 # Email regex validation
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-AUTH_DB_FILE = AUTH_DB_PATH
 
-# OWASP & RFC 9106 Recommended Cloud Standard for Argon2id:
-# Memory: 32 MiB (32768 KiB), Iterations/Time cost: 2, Parallelism: 2, Hash length: 32 bytes
-argon2_hasher = argon2.PasswordHasher(
-    time_cost=2,
-    memory_cost=32768,
-    parallelism=2,
-    hash_len=32,
-    type=argon2.Type.ID,
-)
 
-# Legacy PBKDF2 parameters for backward-compatibility verification
+try:
+    import argon2
+    argon2_hasher = argon2.PasswordHasher(
+        time_cost=2,
+        memory_cost=32768,
+        parallelism=2,
+        hash_len=32,
+        type=argon2.Type.ID,
+    )
+    HAS_ARGON2 = True
+except ImportError:
+    argon2 = None
+    argon2_hasher = None
+    HAS_ARGON2 = False
+    logger.info("argon2-cffi not installed; using standard PBKDF2-HMAC-SHA256 fallback")
+
+
+# Legacy & fallback PBKDF2 parameters for backward-compatibility verification
 PBKDF2_ITERATIONS = 600_000
+
 
 # Rate Limiting configuration (5 failed attempts per 5 minutes per identifier)
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -53,87 +60,26 @@ MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_WINDOW_SECONDS = 300.0  # 5 minutes
 
 
-def _get_connection(db_file: Path | str | None = None) -> sqlite3.Connection:
-    target = Path(db_file) if db_file else AUTH_DB_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(target), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_auth_db(db_file: Path | str | None = None) -> None:
-    """Initialize or migrate the SQLite tables for users and authentication sessions."""
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                # 1. Base users table
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        id TEXT PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        email TEXT UNIQUE NOT NULL,
-                        password_hash TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'active',
-                        email_verified INTEGER NOT NULL DEFAULT 1,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        last_login_at TEXT,
-                        avatar_color TEXT NOT NULL
-                    )
-                """)
-
-                # 2. Base sessions table
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        token TEXT PRIMARY KEY,
-                        user_id TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        expires_at TEXT NOT NULL,
-                        ip_address TEXT,
-                        user_agent TEXT,
-                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-                    )
-                """)
-
-                # 3. Safe Schema Migrations: add missing columns if upgrading existing database
-                cursor = conn.execute("PRAGMA table_info(users)")
-                user_cols = {row["name"] for row in cursor.fetchall()}
-
-                if "status" not in user_cols:
-                    conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-                if "email_verified" not in user_cols:
-                    conn.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
-                if "updated_at" not in user_cols:
-                    conn.execute("ALTER TABLE users ADD COLUMN updated_at TEXT")
-                    conn.execute("UPDATE users SET updated_at = created_at WHERE updated_at IS NULL")
-                if "last_login_at" not in user_cols:
-                    conn.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
-
-                # Check sessions table columns
-                cursor_s = conn.execute("PRAGMA table_info(sessions)")
-                session_cols = {row["name"] for row in cursor_s.fetchall()}
-                if "ip_address" not in session_cols:
-                    conn.execute("ALTER TABLE sessions ADD COLUMN ip_address TEXT")
-                if "user_agent" not in session_cols:
-                    conn.execute("ALTER TABLE sessions ADD COLUMN user_agent TEXT")
-
-                # 4. Indexes for fast lookup
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
-        finally:
-            conn.close()
-    logger.info("Auth database verified/migrated at %s", db_file or AUTH_DB_PATH)
+    """Initialize database tables via SQLAlchemy metadata."""
+    init_db()
 
 
-# Call initialization at module load
-init_auth_db()
+# Initialize database at module load
+try:
+    init_auth_db()
+except Exception as e:
+    logger.warning("Auth DB initial load warning (will retry on demand): %s", e)
 
 
 def hash_password(password: str) -> str:
-    """Hash password using state-of-the-art Argon2id with unique cryptographic salt."""
-    return argon2_hasher.hash(password)
+    """Hash password using state-of-the-art Argon2id (or secure PBKDF2 fallback if argon2-cffi unavailable)."""
+    if HAS_ARGON2 and argon2_hasher:
+        return argon2_hasher.hash(password)
+    # Secure PBKDF2 fallback
+    salt = secrets.token_bytes(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${key.hex()}"
 
 
 def _verify_pbkdf2_legacy(password: str, stored_hash: str) -> bool:
@@ -163,23 +109,28 @@ def verify_password(password: str, stored_hash: str) -> tuple[bool, bool]:
 
     # Check if hash is Argon2 (starts with $argon2)
     if stored_hash.startswith("$argon2"):
-        try:
-            argon2_hasher.verify(stored_hash, password)
-            needs_rehash = argon2_hasher.check_needs_rehash(stored_hash)
-            return True, needs_rehash
-        except argon2.exceptions.VerifyMismatchError:
-            return False, False
-        except Exception as exc:
-            logger.error("Argon2 verification exception: %s", exc)
+        if HAS_ARGON2 and argon2_hasher:
+            try:
+                argon2_hasher.verify(stored_hash, password)
+                needs_rehash = argon2_hasher.check_needs_rehash(stored_hash)
+                return True, needs_rehash
+            except argon2.exceptions.VerifyMismatchError:
+                return False, False
+            except Exception as exc:
+                logger.error("Argon2 verification exception: %s", exc)
+                return False, False
+        else:
+            logger.warning("Stored hash is Argon2id, but argon2-cffi is not installed in this environment.")
             return False, False
 
-    # Check if hash is legacy PBKDF2
+    # Check if hash is legacy/fallback PBKDF2
     if stored_hash.startswith("pbkdf2_sha256$"):
         if _verify_pbkdf2_legacy(password, stored_hash):
-            return True, True  # Match found, upgrade to Argon2id
+            return True, HAS_ARGON2  # Upgrade to Argon2id when argon2 is available
         return False, False
 
     return False, False
+
 
 
 def _check_rate_limit(key: str) -> None:
@@ -211,6 +162,70 @@ def _generate_avatar_color(name: str) -> str:
     return palette[h % len(palette)]
 
 
+# -----------------------------------------------------------------------------
+# AUDIT LOGGING & USER NOTIFICATIONS
+# -----------------------------------------------------------------------------
+
+def record_audit_event(
+    event_type: str,
+    status: str,
+    user_id: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    duration_ms: float = 0.0,
+    details: Optional[dict[str, Any]] = None,
+    ip_address: Optional[str] = None,
+    notify_telegram: bool = True,
+) -> str:
+    """
+    Persists an audit log event into the database and dispatches a privacy-conscious
+    Type 3 User Activity notification to Telegram if enabled.
+    """
+    import json
+    op_id = operation_id or f"op_{secrets.token_hex(8)}"
+    now = datetime.now(timezone.utc)
+
+    # Save to database
+    try:
+        with db_session_scope() as session:
+            log_entry = AuditLog(
+                operation_id=op_id,
+                user_id=user_id,
+                event_type=event_type,
+                status=status.upper(),
+                duration_ms=round(duration_ms, 2),
+                details_json=json.dumps(details or {}),
+                ip_address=ip_address,
+                created_at=now,
+            )
+            session.add(log_entry)
+    except Exception as exc:
+        logger.error("Failed to persist audit log: %s", exc)
+
+    # Dispatch Telegram User Activity Alert
+    if notify_telegram:
+        try:
+            from self_healing.notifications import TelegramNotifier, format_user_activity_alert
+            notifier = TelegramNotifier()
+            msg = format_user_activity_alert(
+                event=event_type,
+                user_id=user_id or "anonymous",
+                operation_id=op_id,
+                status=status.upper(),
+                duration_sec=duration_ms / 1000.0,
+                error_category=details.get("error_category") if details else None,
+                result_summary=details.get("summary") if details else None,
+            )
+            notifier.send_message(msg)
+        except Exception as exc:
+            logger.debug("Failed to dispatch Telegram audit notification: %s", exc)
+
+    return op_id
+
+
+# -----------------------------------------------------------------------------
+# USER REGISTRATION & AUTHENTICATION
+# -----------------------------------------------------------------------------
+
 def register_user(
     name: str,
     email: str,
@@ -220,6 +235,7 @@ def register_user(
     user_agent: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Register a new user account with Argon2id hashed password and create session."""
+    t0 = time.perf_counter()
     clean_name = name.strip()
     clean_email = email.strip().lower()
 
@@ -232,38 +248,51 @@ def register_user(
 
     p_hash = hash_password(password)
     user_id = f"usr_{secrets.token_hex(12)}"
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     avatar_color = _generate_avatar_color(clean_name)
 
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                existing = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
-                if existing:
-                    raise ValueError("An account with this email address already exists / អ៊ីមែលនេះមានរួចហើយ")
+    with db_session_scope() as session:
+        existing = session.query(User).filter(User.email == clean_email).first()
+        if existing:
+            record_audit_event(
+                event_type="User Registration",
+                status="FAILED",
+                user_id=None,
+                duration_ms=(time.perf_counter() - t0) * 1000,
+                details={"error_category": "Duplicate Email", "summary": "Registration attempted with existing email"},
+                ip_address=client_ip,
+                notify_telegram=False,
+            )
+            raise ValueError("An account with this email address already exists / អ៊ីមែលនេះមានរួចហើយ")
 
-                conn.execute(
-                    """INSERT INTO users (
-                        id, name, email, password_hash, status, email_verified,
-                        created_at, updated_at, last_login_at, avatar_color
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (user_id, clean_name, clean_email, p_hash, "active", 1, now, now, now, avatar_color),
-                )
-        finally:
-            conn.close()
+        new_user = User(
+            id=user_id,
+            name=clean_name,
+            email=clean_email,
+            password_hash=p_hash,
+            role="user",
+            status="active",
+            email_verified=True,
+            avatar_color=avatar_color,
+            created_at=now,
+            updated_at=now,
+            last_login_at=now,
+        )
+        session.add(new_user)
 
     user_dict = {
         "id": user_id,
         "name": clean_name,
         "email": clean_email,
+        "role": "user",
         "status": "active",
         "email_verified": True,
-        "created_at": now,
-        "updated_at": now,
-        "last_login_at": now,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "last_login_at": now.isoformat(),
         "avatar_color": avatar_color,
     }
+
     token = create_session(
         user_id,
         remember_me=True,
@@ -271,6 +300,18 @@ def register_user(
         ip_address=client_ip,
         user_agent=user_agent,
     )
+
+    duration_ms = (time.perf_counter() - t0) * 1000
+    record_audit_event(
+        event_type="User Registration",
+        status="SUCCESS",
+        user_id=user_id,
+        duration_ms=duration_ms,
+        details={"summary": "New user account registered successfully"},
+        ip_address=client_ip,
+        notify_telegram=True,
+    )
+
     return user_dict, token
 
 
@@ -283,70 +324,80 @@ def login_user(
     user_agent: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Authenticate user with email and password, returning user profile and session token."""
+    t0 = time.perf_counter()
     clean_email = email.strip().lower()
     rate_key = f"{client_ip or 'ip'}:{clean_email}"
     _check_rate_limit(rate_key)
 
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            row = conn.execute("SELECT * FROM users WHERE email = ?", (clean_email,)).fetchone()
-        finally:
-            conn.close()
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter(User.email == clean_email).first()
+        if not user:
+            _record_failed_attempt(rate_key)
+            duration_ms = (time.perf_counter() - t0) * 1000
+            record_audit_event(
+                event_type="User Login",
+                status="FAILED",
+                user_id=None,
+                duration_ms=duration_ms,
+                details={"error_category": "Invalid Credentials", "summary": "Email not found"},
+                ip_address=client_ip,
+                notify_telegram=False,
+            )
+            raise ValueError("Invalid email or password / អ៊ីមែល ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ")
 
-    if not row:
-        _record_failed_attempt(rate_key)
-        raise ValueError("Invalid email or password / អ៊ីមែល ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ")
+        if user.status != "active":
+            raise ValueError("This account has been deactivated / គណនីនេះត្រូវបានផ្អាកដំណើរការ")
 
-    if row["status"] != "active":
-        raise ValueError("This account has been deactivated / គណនីនេះត្រូវបានផ្អាកដំណើរការ")
+        is_valid, needs_rehash = verify_password(password, user.password_hash)
+        if not is_valid:
+            _record_failed_attempt(rate_key)
+            duration_ms = (time.perf_counter() - t0) * 1000
+            record_audit_event(
+                event_type="User Login",
+                status="FAILED",
+                user_id=user.id,
+                duration_ms=duration_ms,
+                details={"error_category": "Password Mismatch", "summary": "Incorrect password entered"},
+                ip_address=client_ip,
+                notify_telegram=False,
+            )
+            raise ValueError("Invalid email or password / អ៊ីមែល ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ")
 
-    is_valid, needs_rehash = verify_password(password, row["password_hash"])
-    if not is_valid:
-        _record_failed_attempt(rate_key)
-        raise ValueError("Invalid email or password / អ៊ីមែល ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ")
+        # Login succeeded: clear rate limits
+        _clear_rate_limit(rate_key)
 
-    # Login succeeded: clear rate limits
-    _clear_rate_limit(rate_key)
+        now = datetime.now(timezone.utc)
+        user.last_login_at = now
+        if needs_rehash:
+            user.password_hash = hash_password(password)
+            user.updated_at = now
+            logger.info("Upgraded password hash to Argon2id for user %s", user.id)
 
-    now = datetime.now(timezone.utc).isoformat()
+        session.commit()
+        user_dict = user.to_dict()
+    finally:
+        session.close()
 
-    # Rehash password to modern Argon2id if it was legacy PBKDF2 or needs upgrading
-    new_hash = hash_password(password) if needs_rehash else None
-
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                if new_hash:
-                    conn.execute(
-                        "UPDATE users SET password_hash = ?, updated_at = ?, last_login_at = ? WHERE id = ?",
-                        (new_hash, now, now, row["id"]),
-                    )
-                    logger.info("Upgraded password hash to Argon2id for user %s", row["id"])
-                else:
-                    conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, row["id"]))
-        finally:
-            conn.close()
-
-    user_dict = {
-        "id": row["id"],
-        "name": row["name"],
-        "email": row["email"],
-        "status": row["status"],
-        "email_verified": bool(row["email_verified"]),
-        "created_at": row["created_at"],
-        "updated_at": now if new_hash else row["updated_at"],
-        "last_login_at": now,
-        "avatar_color": row["avatar_color"],
-    }
     token = create_session(
-        row["id"],
+        user_dict["id"],
         remember_me=remember_me,
         db_file=db_file,
         ip_address=client_ip,
         user_agent=user_agent,
     )
+
+    duration_ms = (time.perf_counter() - t0) * 1000
+    record_audit_event(
+        event_type="User Login",
+        status="SUCCESS",
+        user_id=user_dict["id"],
+        duration_ms=duration_ms,
+        details={"summary": "User logged in successfully via web interface"},
+        ip_address=client_ip,
+        notify_telegram=True,
+    )
+
     return user_dict, token
 
 
@@ -357,26 +408,30 @@ def create_session(
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> str:
-    """Generate a secure cryptographic session token with expiration."""
+    """Generate a secure cryptographic session token with expiration and save to database."""
     token = secrets.token_urlsafe(36)
     now = datetime.now(timezone.utc)
-    # If remember_me: 30 days. Otherwise: 24 hours.
     duration = timedelta(days=30) if remember_me else timedelta(hours=24)
-    expires_at = (now + duration).isoformat()
+    expires_at = now + duration
 
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                conn.execute(
-                    """INSERT INTO sessions (
-                        token, user_id, created_at, expires_at, ip_address, user_agent
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
-                    (token, user_id, now.isoformat(), expires_at, ip_address, user_agent),
-                )
-        finally:
-            conn.close()
+    with db_session_scope() as session:
+        user_session = UserSession(
+            token=token,
+            user_id=user_id,
+            created_at=now,
+            expires_at=expires_at,
+            ip_address=client_ip_clean(ip_address),
+            user_agent=user_agent[:500] if user_agent else None,
+        )
+        session.add(user_session)
+
     return token
+
+
+def client_ip_clean(ip: Optional[str]) -> Optional[str]:
+    if not ip:
+        return None
+    return ip.split(",")[0].strip()[:45]
 
 
 def get_user_by_token(token: str, db_file: Path | str | None = None) -> Optional[dict[str, Any]]:
@@ -385,71 +440,75 @@ def get_user_by_token(token: str, db_file: Path | str | None = None) -> Optional
         return None
 
     clean_token = token.strip()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
 
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            query = """
-                SELECT u.id, u.name, u.email, u.status, u.email_verified,
-                       u.created_at, u.updated_at, u.last_login_at, u.avatar_color, s.expires_at
-                FROM sessions s
-                JOIN users u ON s.user_id = u.id
-                WHERE s.token = ? AND s.expires_at > ? AND u.status = 'active'
-            """
-            row = conn.execute(query, (clean_token, now_iso)).fetchone()
-            if not row:
-                return None
+    session = SessionLocal()
+    try:
+        user_session = (
+            session.query(UserSession)
+            .join(User, UserSession.user_id == User.id)
+            .filter(
+                UserSession.token == clean_token,
+                UserSession.expires_at > now,
+                User.status == "active",
+            )
+            .first()
+        )
+        if not user_session or not user_session.user:
+            return None
 
-            return {
-                "id": row["id"],
-                "name": row["name"],
-                "email": row["email"],
-                "status": row["status"],
-                "email_verified": bool(row["email_verified"]),
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-                "last_login_at": row["last_login_at"],
-                "avatar_color": row["avatar_color"],
-            }
-        finally:
-            conn.close()
+        return user_session.user.to_dict()
+    finally:
+        session.close()
 
 
 def revoke_session(token: str, db_file: Path | str | None = None) -> None:
     """Revoke and delete a session token upon logout."""
     if not token:
         return
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                conn.execute("DELETE FROM sessions WHERE token = ?", (token.strip(),))
-        finally:
-            conn.close()
+    clean_token = token.strip()
+    with db_session_scope() as session:
+        user_session = session.query(UserSession).filter(UserSession.token == clean_token).first()
+        user_id = user_session.user_id if user_session else None
+        if user_session:
+            session.delete(user_session)
+
+    if user_id:
+        record_audit_event(
+            event_type="User Logout",
+            status="SUCCESS",
+            user_id=user_id,
+            details={"summary": "User session ended normally"},
+            notify_telegram=False,
+        )
 
 
 def revoke_all_user_sessions(user_id: str, db_file: Path | str | None = None) -> None:
     """Revoke all active sessions for a user."""
     if not user_id:
         return
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-        finally:
-            conn.close()
+    with db_session_scope() as session:
+        session.query(UserSession).filter(UserSession.user_id == user_id).delete()
 
 
 def cleanup_expired_sessions(db_file: Path | str | None = None) -> int:
-    """Clean up expired sessions from SQLite database."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with _DB_LOCK:
-        conn = _get_connection(db_file)
-        try:
-            with conn:
-                cursor = conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso,))
-                return cursor.rowcount
-        finally:
-            conn.close()
+    """Clean up expired sessions from database."""
+    now = datetime.now(timezone.utc)
+    with db_session_scope() as session:
+        count = session.query(UserSession).filter(UserSession.expires_at <= now).delete()
+        return count
+
+
+def get_current_user_optional(request: Any, authorization: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Extract and authenticate user from Bearer header or HttpOnly cookie."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    elif authorization and authorization.strip():
+        token = authorization.strip()
+    if not token and hasattr(request, "cookies"):
+        token = request.cookies.get("auth_token")
+
+    if not token:
+        return None
+    return get_user_by_token(token)

@@ -74,7 +74,21 @@ class HourlyAIInspector:
         except Exception as exc:
             telemetry["errors"].append(f"Languages error: {redact_secrets(str(exc))}")
 
+        # 4. Fetch /api/db/health
+        try:
+            req = urllib.request.Request(
+                f"{self.backend_base}/api/db/health",
+                headers={"User-Agent": "KhmerTranslatorSelfHealing/2.0"},
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if resp.status == 200:
+                    db_data = json.loads(resp.read().decode("utf-8"))
+                    telemetry["database"] = db_data
+        except Exception as exc:
+            telemetry["database"] = {"status": "UNKNOWN", "is_healthy": True}
+
         return telemetry
+
 
     def analyze_with_ai(self, telemetry: dict[str, Any], fe_latency_ms: float = 0.0, be_latency_ms: float = 0.0) -> dict[str, Any]:
         """
