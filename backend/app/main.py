@@ -270,18 +270,34 @@ def get_disk_free_mb(path: Path) -> int:
 @app.get("/health", response_model=HealthResponse)
 def health_root():
     """Lightweight root health probe for Render health check path and UptimeRobot."""
-    return HealthResponse(status="ok", app=settings.app_name, version=settings.app_version)
+    from .db.database import check_db_health
+    db_info = check_db_health()
+    status_str = "ok" if db_info["is_healthy"] else "degraded"
+    return HealthResponse(status=status_str, app=settings.app_name, version=settings.app_version)
 
 
 @app.get("/api/health", response_model=HealthResponse)
 def health():
-    return HealthResponse(status="ok", app=settings.app_name, version=settings.app_version)
+    from .db.database import check_db_health
+    db_info = check_db_health()
+    status_str = "ok" if db_info["is_healthy"] else "degraded"
+    return HealthResponse(status=status_str, app=settings.app_name, version=settings.app_version)
 
+
+@app.get("/api/db/health")
+def db_health():
+    """Returns database connection status, engine type, and latency."""
+    from .db.database import check_db_health
+    return check_db_health()
 
 
 @app.get("/api/ready", response_model=ReadinessResponse)
 async def ready(response: Response):
     """Production readiness probe for Kubernetes, Docker, or systemd."""
+    from .db.database import check_db_health
+    db_info = check_db_health()
+    db_ok = db_info["is_healthy"]
+
     ffmpeg_ok = command_exists("ffmpeg")
     ffprobe_ok = command_exists("ffprobe")
     try:
@@ -308,6 +324,7 @@ async def ready(response: Response):
 
     active_count = len([j for j in list_jobs() if j.get("status") in ("processing", "uploading", "transcribing", "dubbing", "exporting")])
     checks = {
+        "database": db_ok,
         "ffmpeg": ffmpeg_ok,
         "ffprobe": ffprobe_ok,
         "faster_whisper": whisper_ok,
@@ -315,7 +332,7 @@ async def ready(response: Response):
         "storage_writable": storage_writable,
     }
 
-    is_ready = ffmpeg_ok and ffprobe_ok and storage_writable
+    is_ready = ffmpeg_ok and ffprobe_ok and storage_writable and db_ok
     if not is_ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
@@ -331,6 +348,7 @@ async def ready(response: Response):
         active_jobs=active_count,
         checks=checks,
     )
+
 
 
 # =============================================================================

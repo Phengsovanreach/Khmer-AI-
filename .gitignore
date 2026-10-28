@@ -57,8 +57,11 @@ _backups/
 *.tmp
 *.swp
 *.swo
+self_healing_state.json
+.self_healing_repair.lock
 
 # OS system files
 .DS_Store
 Thumbs.db
 desktop.ini
+.neon

@@ -1,0 +1,77 @@
+name: Khmer Translator Controlled Self-Repair Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      incident_id:
+        description: "Confirmed Incident Identifier to repair (e.g. INC-BE-001)"
+        required: true
+        type: string
+      target_file:
+        description: "Relative file to repair (e.g. backend/app/main.py)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: self-healing-repair-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  controlled-repair:
+    name: Isolated AI Repair & Automated PR Proposal
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install FFmpeg & Test Tools
+        run: |
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+          fi
+          python -m pip install --upgrade pip
+          pip install pytest pytest-mock -r backend/requirements.txt
+          cd frontend && npm ci
+
+      - name: Execute Controlled Repair Cycle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          INCIDENT_ID: ${{ inputs.incident_id }}
+        run: |
+          python -c "
+          from self_healing.state import IncidentTracker
+          from self_healing.ai import FailureAnalyzer
+          from self_healing.diagnostics import DiagnosticCollector
+          from self_healing.models import ServiceType
+          import os
+
+          inc_id = os.environ.get('INCIDENT_ID')
+          tracker = IncidentTracker()
+          active_be = tracker.get_active_incident(ServiceType.BACKEND)
+          active_fe = tracker.get_active_incident(ServiceType.FRONTEND)
+          target = active_be if (active_be and active_be.incident_id == inc_id) else active_fe
+          if not target:
+              print(f'Incident {inc_id} not currently active. Proceeding with safety check.')
+          "

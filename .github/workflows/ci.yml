@@ -2,14 +2,18 @@ name: Khmer Translator CI Pipeline
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, feature/self-healing-system]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, feature/self-healing-system]
+
+permissions:
+  contents: read
 
 jobs:
   backend-tests:
     name: Backend Unit & Integration Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -21,10 +25,13 @@ jobs:
           cache: "pip"
           cache-dependency-path: backend/requirements.txt
 
-      - name: Install FFmpeg
+      - name: Verify FFmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version
 
       - name: Install Backend Dependencies
         run: |
@@ -39,6 +46,7 @@ jobs:
   frontend-build:
     name: Frontend TypeScript & Production Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -59,3 +67,62 @@ jobs:
         run: |
           cd frontend
           npm run build
+
+  self-healing-tests:
+    name: Self-Healing Architecture Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-mock
+
+      - name: Verify Python Syntax & Imports
+        run: |
+          python -m py_compile self_healing/*.py self_healing/**/*.py
+
+      - name: Run Self-Healing Test Suite
+        run: |
+          pytest self_healing/tests/ -v
+
+  ci-notify:
+    name: Telegram Pipeline Notification
+    needs: [backend-tests, frontend-build, self-healing-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dispatch Telegram CI Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATUS="SUCCESS"
+          if [ "${{ needs.backend-tests.result }}" != "success" ] || \
+             [ "${{ needs.frontend-build.result }}" != "success" ] || \
+             [ "${{ needs.self-healing-tests.result }}" != "success" ]; then
+            STATUS="FAILURE"
+          fi
+
+          python -m self_healing.cli ci-notify \
+            --status "$STATUS" \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --message "${{ github.event.head_commit.message }}" \
+            --details '{"Backend Unit Tests": "${{ needs.backend-tests.result }}", "Frontend Build": "${{ needs.frontend-build.result }}", "Self-Healing Tests": "${{ needs.self-healing-tests.result }}"}'

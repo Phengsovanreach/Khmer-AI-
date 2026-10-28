@@ -1,0 +1,72 @@
+name: Khmer Translator 24/7 Cloud Monitor & Self-Healing
+
+on:
+  schedule:
+    # Run every 30 minutes 24/7 (best-effort cloud scheduler on GitHub runners)
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_probe:
+        description: "Force synthetic check regardless of schedule"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: self-healing-cloud-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cloud-monitor:
+    name: 24/7 Autonomous Health Probe & Diagnostic
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install sqlalchemy alembic psycopg2-binary
+
+      - name: Restore Incident State
+        uses: actions/cache@v4
+        with:
+          path: self_healing_state.json
+          key: self-healing-state-${{ github.run_id }}
+          restore-keys: |
+            self-healing-state-
+
+      - name: Execute Synthetic Probes & State Processing
+        env:
+          FRONTEND_URL: "https://khmer-ai-16c.pages.dev"
+          BACKEND_HEALTH_URL: "https://khmer-ai-1ktp.onrender.com/api/health"
+          BACKEND_READY_URL: "https://khmer-ai-1ktp.onrender.com/api/ready"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALWAYS_NOTIFY: "true"
+        run: |
+          python -m self_healing.cli check --always-notify
+
+
+      - name: Save Incident State Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-state
+          path: self_healing_state.json
+          retention-days: 7

@@ -3,7 +3,7 @@ services:
     name: khmer-translator-backend
     runtime: docker
     dockerfilePath: Dockerfile
-    plan: standard
+    plan: free
     healthCheckPath: /api/ready
     envVars:
       - key: PYTHONUNBUFFERED
@@ -14,3 +14,19 @@ services:
         value: "cpu"
       - key: WHISPER_COMPUTE_TYPE
         value: "int8"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: khmer-translator-db
+          property: connectionString
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+
+databases:
+  - name: khmer-translator-db
+    plan: free
+    databaseName: khmer_translator
+    user: khmer_admin
